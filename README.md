@@ -2,6 +2,84 @@
 
 A kubectl plugin that explains **WHY** a permission is granted in Kubernetes RBAC by showing the exact Role/ClusterRole + Binding chain.
 
+## Quick Example
+
+```bash
+kubectl rbac-why can-i --as system:serviceaccount:default:my-sa get secrets -n default
+```
+
+```
+ALLOWED: ServiceAccount default/my-sa can get secrets in namespace default
+
+Permission granted through 1 path(s):
+
+Path 1:
+  Subject: ServiceAccount default/my-sa
+      |
+      v
+  RoleBinding: my-sa-secret-reader (namespace: default)
+      |
+      v
+  Role: secret-reader (namespace: default)
+      |
+      v
+  Rule: apiGroups=[""], resources=[secrets], verbs=[get, list, watch]
+  Scope: namespace
+```
+
+### Multiple Grant Paths
+
+When a permission is granted through multiple roles, all paths are shown:
+
+```bash
+kubectl rbac-why can-i --as system:serviceaccount:default:admin-sa get pods -n default
+```
+
+```
+ALLOWED: ServiceAccount default/admin-sa can get pods in namespace default
+
+Permission granted through 3 path(s):
+
+Path 1:
+  Subject: ServiceAccount default/admin-sa
+      |
+      v
+  RoleBinding: admin-sa-pod-reader (namespace: default)
+      |
+      v
+  Role: pod-reader (namespace: default)
+      |
+      v
+  Rule: apiGroups=[""], resources=[pods], verbs=[get, list, watch]
+  Scope: namespace
+
+Path 2:
+  Subject: ServiceAccount default/admin-sa
+      |
+      v
+  RoleBinding: admin-sa-edit (namespace: default)
+      |
+      v
+  ClusterRole: edit
+      |
+      v
+  Rule: apiGroups=[""], resources=[pods], verbs=[get, list, watch, create, update, patch, delete]
+  Scope: namespace
+
+Path 3:
+  Subject: ServiceAccount default/admin-sa
+      |
+      v
+  ClusterRoleBinding: admin-sa-cluster-view
+      |
+      v
+  ClusterRole: view
+      |
+      v
+  Rule: apiGroups=[""], resources=[pods], verbs=[get, list, watch]
+  Scope: cluster-wide
+```
+
 ## Why This Tool?
 
 Kubernetes RBAC can become incredibly difficult to debug as clusters grow in complexity:
@@ -33,31 +111,10 @@ kubectl rbac-why can-i --as <subject> <verb> <resource>
 
 ## Usage
 
-### Basic Permission Check
+### Basic Syntax
 
 ```bash
-# Check why a service account can get secrets
-kubectl rbac-why can-i --as system:serviceaccount:default:my-sa get secrets -n default
-```
-
-Output:
-```
-ALLOWED: ServiceAccount default/my-sa can get secrets in namespace default
-
-Permission granted through 1 path(s):
-
-Path 1:
-  Subject: ServiceAccount default/my-sa
-      |
-      v
-  RoleBinding: my-sa-secret-reader (namespace: default)
-      |
-      v
-  Role: secret-reader (namespace: default)
-      |
-      v
-  Rule: apiGroups=[""], resources=[secrets], verbs=[get, list, watch]
-  Scope: namespace
+kubectl rbac-why can-i --as <subject> <verb> <resource> [-n namespace]
 ```
 
 ### Check Cluster-Wide Permissions

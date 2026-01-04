@@ -142,3 +142,172 @@ roleRef:
   kind: ClusterRole
   name: view
   apiGroup: rbac.authorization.k8s.io
+---
+# ============================================================
+# Multi-Grant Test Fixtures: 2 roles granting same permission
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dual-grant-sa
+  namespace: test-ns
+---
+# Role 1: grants get/list configmaps
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: configmap-reader-role
+  namespace: test-ns
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list"]
+---
+# ClusterRole 2: also grants get/list configmaps
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: test-configmap-reader-clusterrole
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list"]
+---
+# RoleBinding: dual-grant-sa -> configmap-reader-role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: dual-grant-sa-role
+  namespace: test-ns
+subjects:
+- kind: ServiceAccount
+  name: dual-grant-sa
+  namespace: test-ns
+roleRef:
+  kind: Role
+  name: configmap-reader-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# ClusterRoleBinding: dual-grant-sa -> configmap-reader-clusterrole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dual-grant-sa-clusterrole
+subjects:
+- kind: ServiceAccount
+  name: dual-grant-sa
+  namespace: test-ns
+roleRef:
+  kind: ClusterRole
+  name: test-configmap-reader-clusterrole
+  apiGroup: rbac.authorization.k8s.io
+---
+# ============================================================
+# Multi-Grant Test Fixtures: 4 roles granting same permission
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: quad-grant-sa
+  namespace: test-ns
+---
+# Role 1: grants get pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-getter-role-1
+  namespace: test-ns
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get"]
+---
+# Role 2: also grants get pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-getter-role-2
+  namespace: test-ns
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+# ClusterRole 3: grants get pods (will be referenced by RoleBinding)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: test-pod-getter-clusterrole-1
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "watch"]
+---
+# ClusterRole 4: grants get pods (will be referenced by ClusterRoleBinding)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: test-pod-getter-clusterrole-2
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+# RoleBinding 1: quad-grant-sa -> pod-getter-role-1
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: quad-grant-sa-role-1
+  namespace: test-ns
+subjects:
+- kind: ServiceAccount
+  name: quad-grant-sa
+  namespace: test-ns
+roleRef:
+  kind: Role
+  name: pod-getter-role-1
+  apiGroup: rbac.authorization.k8s.io
+---
+# RoleBinding 2: quad-grant-sa -> pod-getter-role-2
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: quad-grant-sa-role-2
+  namespace: test-ns
+subjects:
+- kind: ServiceAccount
+  name: quad-grant-sa
+  namespace: test-ns
+roleRef:
+  kind: Role
+  name: pod-getter-role-2
+  apiGroup: rbac.authorization.k8s.io
+---
+# RoleBinding 3: quad-grant-sa -> ClusterRole (namespace-scoped)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: quad-grant-sa-clusterrole-ns
+  namespace: test-ns
+subjects:
+- kind: ServiceAccount
+  name: quad-grant-sa
+  namespace: test-ns
+roleRef:
+  kind: ClusterRole
+  name: test-pod-getter-clusterrole-1
+  apiGroup: rbac.authorization.k8s.io
+---
+# ClusterRoleBinding 4: quad-grant-sa -> ClusterRole (cluster-wide)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: quad-grant-sa-clusterrole-cw
+subjects:
+- kind: ServiceAccount
+  name: quad-grant-sa
+  namespace: test-ns
+roleRef:
+  kind: ClusterRole
+  name: test-pod-getter-clusterrole-2
+  apiGroup: rbac.authorization.k8s.io
