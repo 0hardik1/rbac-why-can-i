@@ -1,0 +1,144 @@
+---
+# Namespace for testing
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-ns
+---
+# Service Account for testing
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: test-sa
+  namespace: test-ns
+---
+# Another Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: admin-sa
+  namespace: test-ns
+---
+# Role: secret-reader - can read secrets in test-ns
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: secret-reader
+  namespace: test-ns
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch"]
+---
+# RoleBinding: test-sa -> secret-reader
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: test-sa-secret-reader
+  namespace: test-ns
+subjects:
+- kind: ServiceAccount
+  name: test-sa
+  namespace: test-ns
+roleRef:
+  kind: Role
+  name: secret-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+# Role: pod-manager - can manage pods
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pod-manager
+  namespace: test-ns
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+# RoleBinding: admin-sa -> pod-manager
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: admin-sa-pod-manager
+  namespace: test-ns
+subjects:
+- kind: ServiceAccount
+  name: admin-sa
+  namespace: test-ns
+roleRef:
+  kind: Role
+  name: pod-manager
+  apiGroup: rbac.authorization.k8s.io
+---
+# ClusterRole: node-reader - can read nodes cluster-wide
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: test-node-reader
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list", "watch"]
+---
+# ClusterRoleBinding: test-sa -> node-reader
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: test-sa-node-reader
+subjects:
+- kind: ServiceAccount
+  name: test-sa
+  namespace: test-ns
+roleRef:
+  kind: ClusterRole
+  name: test-node-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+# ClusterRole with wildcards (for risky permission testing)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: test-risky-role
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["*"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+---
+# ClusterRoleBinding: admin-sa -> risky-role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: admin-sa-risky
+subjects:
+- kind: ServiceAccount
+  name: admin-sa
+  namespace: test-ns
+roleRef:
+  kind: ClusterRole
+  name: test-risky-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# RoleBinding that uses ClusterRole (common pattern)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: test-sa-view-clusterrole
+  namespace: test-ns
+subjects:
+- kind: ServiceAccount
+  name: test-sa
+  namespace: test-ns
+roleRef:
+  kind: ClusterRole
+  name: view
+  apiGroup: rbac.authorization.k8s.io
