@@ -95,18 +95,18 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 	savedImpersonate := o.ConfigFlags.Impersonate
 	savedImpersonateGroup := o.ConfigFlags.ImpersonateGroup
 	savedImpersonateUID := o.ConfigFlags.ImpersonateUID
-	
+
 	// Temporarily clear impersonation settings
 	emptyString := ""
 	o.ConfigFlags.Impersonate = &emptyString
 	o.ConfigFlags.ImpersonateGroup = &[]string{}
 	o.ConfigFlags.ImpersonateUID = &emptyString
-	
+
 	restConfig, err := o.ConfigFlags.ToRESTConfig()
 	if err != nil {
 		return fmt.Errorf("failed to create REST config: %w", err)
 	}
-	
+
 	// Restore impersonation settings
 	o.ConfigFlags.Impersonate = savedImpersonate
 	o.ConfigFlags.ImpersonateGroup = savedImpersonateGroup
