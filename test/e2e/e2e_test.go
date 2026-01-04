@@ -279,12 +279,13 @@ func TestShowRisky(t *testing.T) {
 	}
 }
 
-func TestMultipleGrants(t *testing.T) {
-	// test-sa should have multiple paths to some permissions
-	// (view ClusterRole via RoleBinding + node-reader via ClusterRoleBinding)
+func TestMultipleGrants_TwoRoles(t *testing.T) {
+	// dual-grant-sa has the same permission (get configmaps) granted through:
+	// 1. RoleBinding -> Role (configmap-reader-role)
+	// 2. ClusterRoleBinding -> ClusterRole (test-configmap-reader-clusterrole)
 	out, err := runRbacWhy(
 		"can-i",
-		"--as", "system:serviceaccount:test-ns:test-sa",
+		"--as", "system:serviceaccount:test-ns:dual-grant-sa",
 		"get", "configmaps",
 		"-n", testNS,
 		"-o", "json",
@@ -295,17 +296,94 @@ func TestMultipleGrants(t *testing.T) {
 
 	var result output.JSONOutput
 	if err := json.Unmarshal([]byte(out), &result); err != nil {
-		t.Fatalf("invalid JSON: %v", err)
+		t.Fatalf("invalid JSON: %v\nOutput: %s", err, out)
 	}
 
-	// If granted, verify we get the expected structure
-	if result.Allowed && len(result.Grants) > 0 {
-		grant := result.Grants[0]
-		if grant.Binding.Kind == "" {
-			t.Errorf("expected binding kind to be set")
+	if !result.Allowed {
+		t.Fatalf("expected permission to be allowed")
+	}
+
+	// Must have exactly 2 grants
+	if len(result.Grants) != 2 {
+		t.Errorf("expected 2 grants, got %d", len(result.Grants))
+		for i, g := range result.Grants {
+			t.Logf("Grant %d: %s/%s -> %s/%s", i, g.Binding.Kind, g.Binding.Name, g.Role.Kind, g.Role.Name)
 		}
-		if grant.Role.Kind == "" {
-			t.Errorf("expected role kind to be set")
+	}
+
+	// Verify we have one from RoleBinding and one from ClusterRoleBinding
+	var hasRoleBinding, hasClusterRoleBinding bool
+	for _, grant := range result.Grants {
+		if grant.Binding.Kind == "RoleBinding" && grant.Role.Kind == "Role" {
+			hasRoleBinding = true
 		}
+		if grant.Binding.Kind == "ClusterRoleBinding" && grant.Role.Kind == "ClusterRole" {
+			hasClusterRoleBinding = true
+		}
+	}
+
+	if !hasRoleBinding {
+		t.Errorf("expected a grant from RoleBinding -> Role")
+	}
+	if !hasClusterRoleBinding {
+		t.Errorf("expected a grant from ClusterRoleBinding -> ClusterRole")
+	}
+}
+
+func TestMultipleGrants_FourRoles(t *testing.T) {
+	// quad-grant-sa has the same permission (get pods) granted through 4 paths:
+	// 1. RoleBinding -> Role (pod-getter-role-1)
+	// 2. RoleBinding -> Role (pod-getter-role-2)
+	// 3. RoleBinding -> ClusterRole (test-pod-getter-clusterrole-1)
+	// 4. ClusterRoleBinding -> ClusterRole (test-pod-getter-clusterrole-2)
+	out, err := runRbacWhy(
+		"can-i",
+		"--as", "system:serviceaccount:test-ns:quad-grant-sa",
+		"get", "pods",
+		"-n", testNS,
+		"-o", "json",
+	)
+	if err != nil {
+		t.Fatalf("command failed: %v", err)
+	}
+
+	var result output.JSONOutput
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("invalid JSON: %v\nOutput: %s", err, out)
+	}
+
+	if !result.Allowed {
+		t.Fatalf("expected permission to be allowed")
+	}
+
+	// Must have exactly 4 grants
+	if len(result.Grants) != 4 {
+		t.Errorf("expected 4 grants, got %d", len(result.Grants))
+		for i, g := range result.Grants {
+			t.Logf("Grant %d: %s/%s -> %s/%s", i, g.Binding.Kind, g.Binding.Name, g.Role.Kind, g.Role.Name)
+		}
+	}
+
+	// Verify grant types
+	var roleBindingToRole, roleBindingToClusterRole, clusterRoleBinding int
+	for _, grant := range result.Grants {
+		switch {
+		case grant.Binding.Kind == "RoleBinding" && grant.Role.Kind == "Role":
+			roleBindingToRole++
+		case grant.Binding.Kind == "RoleBinding" && grant.Role.Kind == "ClusterRole":
+			roleBindingToClusterRole++
+		case grant.Binding.Kind == "ClusterRoleBinding":
+			clusterRoleBinding++
+		}
+	}
+
+	if roleBindingToRole != 2 {
+		t.Errorf("expected 2 grants from RoleBinding -> Role, got %d", roleBindingToRole)
+	}
+	if roleBindingToClusterRole != 1 {
+		t.Errorf("expected 1 grant from RoleBinding -> ClusterRole, got %d", roleBindingToClusterRole)
+	}
+	if clusterRoleBinding != 1 {
+		t.Errorf("expected 1 grant from ClusterRoleBinding -> ClusterRole, got %d", clusterRoleBinding)
 	}
 }
