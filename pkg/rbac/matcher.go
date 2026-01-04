@@ -139,9 +139,14 @@ func SubjectMatchesWithGroups(bindingSubject rbacv1.Subject, requestSubject Subj
 	return false
 }
 
-// GetImplicitGroups returns the implicit groups a subject belongs to
+// GetImplicitGroups returns all groups a subject belongs to (explicit + implicit)
 func GetImplicitGroups(subject Subject) []string {
-	groups := []string{"system:authenticated"}
+	// Start with explicit groups from the subject (e.g., from client certificate)
+	groups := make([]string, 0, len(subject.Groups)+3)
+	groups = append(groups, subject.Groups...)
+
+	// Add implicit groups
+	groups = append(groups, "system:authenticated")
 
 	if subject.Kind == "ServiceAccount" {
 		groups = append(groups,

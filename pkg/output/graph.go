@@ -12,11 +12,16 @@ import (
 // DotPrinter outputs GraphViz DOT format
 type DotPrinter struct{}
 
-func (p *DotPrinter) Print(w io.Writer, result *rbac.PermissionResult) error {
+func (p *DotPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *ContextInfo) error {
 	_, _ = fmt.Fprintln(w, "digraph rbac {")
 	_, _ = fmt.Fprintln(w, "  rankdir=LR;")
 	_, _ = fmt.Fprintln(w, "  node [shape=box fontname=\"Helvetica\"];")
 	_, _ = fmt.Fprintln(w, "  edge [fontname=\"Helvetica\" fontsize=10];")
+
+	// Add context info as a comment if using current context
+	if ctx != nil {
+		_, _ = fmt.Fprintf(w, "  // Context: %s, Cluster: %s, User: %s\n", ctx.ContextName, ctx.ClusterName, ctx.UserName)
+	}
 	_, _ = fmt.Fprintln(w)
 
 	if !result.Allowed {
@@ -72,7 +77,11 @@ func (p *DotPrinter) Print(w io.Writer, result *rbac.PermissionResult) error {
 // MermaidPrinter outputs Mermaid diagram format
 type MermaidPrinter struct{}
 
-func (p *MermaidPrinter) Print(w io.Writer, result *rbac.PermissionResult) error {
+func (p *MermaidPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *ContextInfo) error {
+	// Add context info as a comment if using current context
+	if ctx != nil {
+		_, _ = fmt.Fprintf(w, "%%%% Context: %s, Cluster: %s, User: %s\n", ctx.ContextName, ctx.ClusterName, ctx.UserName)
+	}
 	_, _ = fmt.Fprintln(w, "graph LR")
 
 	if !result.Allowed {

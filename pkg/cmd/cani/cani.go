@@ -17,32 +17,41 @@ var (
 
 Shows the exact Role/ClusterRole and Binding chain that grants
 a permission to a subject. This helps answer the question:
-"WHY can this service account do X?"
+"WHY can this user/service account do X?"
 
 Unlike 'kubectl auth can-i', this tool doesn't just tell you
 yes/no, it shows you the complete RBAC chain that grants
-the permission.`
+the permission.
 
-	examples = `  # Check why a service account can get secrets
+If --as is not specified, the tool uses the current kubeconfig
+context to determine the subject.`
+
+	examples = `  # Check why the current user can get secrets (uses current kubeconfig context)
+  kubectl rbac-why can-i get secrets -n default
+
+  # Check why a specific service account can get secrets
   kubectl rbac-why can-i --as system:serviceaccount:default:my-sa get secrets -n default
 
   # Check cluster-wide permissions for listing nodes
   kubectl rbac-why can-i --as system:serviceaccount:kube-system:admin list nodes
 
-  # Check pod exec permissions
-  kubectl rbac-why can-i --as system:serviceaccount:default:debug-sa create pods/exec -n default
+  # Check pod exec permissions for current user
+  kubectl rbac-why can-i create pods/exec -n default
 
   # Output as JSON for programmatic use
-  kubectl rbac-why can-i --as system:serviceaccount:default:my-sa get pods -o json
+  kubectl rbac-why can-i get pods -o json
 
   # Generate a DOT graph
-  kubectl rbac-why can-i --as system:serviceaccount:default:my-sa get pods -o dot | dot -Tpng > rbac.png
+  kubectl rbac-why can-i get pods -o dot | dot -Tpng > rbac.png
 
   # Generate a Mermaid diagram
-  kubectl rbac-why can-i --as system:serviceaccount:default:my-sa get pods -o mermaid
+  kubectl rbac-why can-i get pods -o mermaid
 
   # Show risky permissions for a subject
-  kubectl rbac-why can-i --as system:serviceaccount:default:my-sa --show-risky -n default`
+  kubectl rbac-why can-i --as system:serviceaccount:default:my-sa --show-risky -n default
+
+  # Show risky permissions for current user
+  kubectl rbac-why can-i --show-risky -n default`
 )
 
 // NewCmdRbacWhy creates the rbac-why root command
@@ -50,7 +59,7 @@ func NewCmdRbacWhy(streams genericclioptions.IOStreams) *cobra.Command {
 	o := NewRbacWhyOptions(streams)
 
 	cmd := &cobra.Command{
-		Use:     "rbac-why can-i --as SUBJECT VERB RESOURCE [flags]",
+		Use:     "rbac-why can-i [--as SUBJECT] VERB RESOURCE [flags]",
 		Short:   "Explain why a permission is granted in RBAC",
 		Long:    longDesc,
 		Example: examples,
@@ -87,6 +96,12 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 	subject, err := rbac.ParseSubject(o.As)
 	if err != nil {
 		return fmt.Errorf("failed to parse subject: %w", err)
+	}
+
+	// If we extracted groups from the current context (e.g., from client certificate),
+	// add them to the subject so they're used in RBAC resolution
+	if !o.AsProvided && o.CurrentContext != nil && len(o.CurrentContext.Groups) > 0 {
+		subject.Groups = o.CurrentContext.Groups
 	}
 
 	// Create Kubernetes client WITHOUT impersonation
@@ -137,7 +152,21 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 		return err
 	}
 
-	return printer.Print(o.Out, result)
+	// Convert context info for output if using current context
+	var ctxInfo *output.ContextInfo
+	if !o.AsProvided && o.CurrentContext != nil {
+		ctxInfo = &output.ContextInfo{
+			ContextName: o.CurrentContext.ContextName,
+			ClusterName: o.CurrentContext.ClusterName,
+			AuthInfo:    o.CurrentContext.AuthInfo,
+			UserName:    o.CurrentContext.UserName,
+			Groups:      o.CurrentContext.Groups,
+			AuthMethod:  o.CurrentContext.AuthMethod,
+			Namespace:   o.CurrentContext.Namespace,
+		}
+	}
+
+	return printer.Print(o.Out, result, ctxInfo)
 }
 
 // runRiskyAnalysis shows risky permissions for a subject

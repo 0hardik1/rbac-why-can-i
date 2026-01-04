@@ -24,9 +24,10 @@ func (p PermissionRequest) FullResource() string {
 
 // Subject represents who is requesting access
 type Subject struct {
-	Kind      string // User, Group, ServiceAccount
+	Kind      string   // User, Group, ServiceAccount
 	Name      string
-	Namespace string // Only for ServiceAccount
+	Namespace string   // Only for ServiceAccount
+	Groups    []string // Explicit groups (e.g., from client certificate)
 }
 
 // String returns a human-readable representation of the subject
