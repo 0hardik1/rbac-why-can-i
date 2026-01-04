@@ -4,6 +4,38 @@ A kubectl plugin that explains **WHY** a permission is granted in Kubernetes RBA
 
 ## Quick Example
 
+### Using Current Context (--as not required)
+
+```bash
+kubectl rbac-why can-i get secrets -n default
+```
+
+```
+Using current context:
+  Context:  my-cluster-admin
+  Cluster:  my-cluster
+  User:     admin@example.com
+
+ALLOWED: User admin@example.com can get secrets in namespace default
+
+Permission granted through 1 path(s):
+
+Path 1:
+  Subject: User admin@example.com
+      |
+      v
+  ClusterRoleBinding: cluster-admin-binding
+      |
+      v
+  ClusterRole: cluster-admin
+      |
+      v
+  Rule: apiGroups=["*"], resources=[*], verbs=[*]
+  Scope: cluster-wide
+```
+
+### Checking a Specific Subject
+
 ```bash
 kubectl rbac-why can-i --as system:serviceaccount:default:my-sa get secrets -n default
 ```
@@ -114,42 +146,62 @@ kubectl rbac-why can-i --as <subject> <verb> <resource>
 ### Basic Syntax
 
 ```bash
+# Using current kubeconfig context (recommended for checking your own permissions)
+kubectl rbac-why can-i <verb> <resource> [-n namespace]
+
+# Check permissions for a specific subject
 kubectl rbac-why can-i --as <subject> <verb> <resource> [-n namespace]
+```
+
+### Check Your Own Permissions
+
+```bash
+# Can I get secrets in the default namespace?
+kubectl rbac-why can-i get secrets -n default
+
+# Can I create deployments?
+kubectl rbac-why can-i create deployments.apps -n my-namespace
 ```
 
 ### Check Cluster-Wide Permissions
 
 ```bash
+kubectl rbac-why can-i list nodes
 kubectl rbac-why can-i --as system:serviceaccount:kube-system:admin list nodes
 ```
 
 ### Check Subresource Access
 
 ```bash
+kubectl rbac-why can-i create pods/exec -n default
 kubectl rbac-why can-i --as system:serviceaccount:default:debug-sa create pods/exec -n default
 ```
 
 ### Output Formats
 
 ```bash
-# JSON output
-kubectl rbac-why can-i --as system:serviceaccount:default:my-sa get pods -o json
+# JSON output (includes context info when --as is not provided)
+kubectl rbac-why can-i get pods -o json
 
 # YAML output
-kubectl rbac-why can-i --as system:serviceaccount:default:my-sa get pods -o yaml
+kubectl rbac-why can-i get pods -o yaml
 
 # GraphViz DOT format (pipe to dot for visualization)
-kubectl rbac-why can-i --as system:serviceaccount:default:my-sa get pods -o dot | dot -Tpng > rbac.png
+kubectl rbac-why can-i get pods -o dot | dot -Tpng > rbac.png
 
 # Mermaid diagram format
-kubectl rbac-why can-i --as system:serviceaccount:default:my-sa get pods -o mermaid
+kubectl rbac-why can-i get pods -o mermaid
 ```
 
 ### Risky Permissions Analysis
 
-Analyze a subject's permissions for potentially dangerous patterns:
+Analyze permissions for potentially dangerous patterns:
 
 ```bash
+# Analyze your own risky permissions
+kubectl rbac-why can-i --show-risky -n default
+
+# Analyze a specific subject's risky permissions
 kubectl rbac-why can-i --as system:serviceaccount:default:my-sa --show-risky -n default
 ```
 

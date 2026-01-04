@@ -12,9 +12,21 @@ import (
 	"github.com/hardik/kubectl-rbac-why/pkg/rbac"
 )
 
+// ContextInfo holds information about the current kubeconfig context
+// Used when --as is not provided to show where the subject came from
+type ContextInfo struct {
+	ContextName string
+	ClusterName string
+	AuthInfo    string   // The kubeconfig authInfo name
+	UserName    string   // The actual user identity (e.g., CN from cert)
+	Groups      []string // Groups the user belongs to (e.g., O from cert)
+	Namespace   string
+	AuthMethod  string // e.g., "client-certificate", "token", "exec", etc.
+}
+
 // Printer interface for different output formats
 type Printer interface {
-	Print(w io.Writer, result *rbac.PermissionResult) error
+	Print(w io.Writer, result *rbac.PermissionResult, ctx *ContextInfo) error
 }
 
 // NewPrinter creates a printer based on the output format
@@ -38,7 +50,26 @@ func NewPrinter(format string) (Printer, error) {
 // TextPrinter outputs human-readable text
 type TextPrinter struct{}
 
-func (p *TextPrinter) Print(w io.Writer, result *rbac.PermissionResult) error {
+func (p *TextPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *ContextInfo) error {
+	// If using current context (--as not provided), show context info first
+	if ctx != nil {
+		_, _ = fmt.Fprintf(w, "Using current context:\n")
+		_, _ = fmt.Fprintf(w, "  Context:    %s\n", ctx.ContextName)
+		_, _ = fmt.Fprintf(w, "  Cluster:    %s\n", ctx.ClusterName)
+		_, _ = fmt.Fprintf(w, "  AuthInfo:   %s\n", ctx.AuthInfo)
+		_, _ = fmt.Fprintf(w, "  User:       %s\n", ctx.UserName)
+		if len(ctx.Groups) > 0 {
+			_, _ = fmt.Fprintf(w, "  Groups:     %s\n", strings.Join(ctx.Groups, ", "))
+		}
+		if ctx.AuthMethod != "" {
+			_, _ = fmt.Fprintf(w, "  AuthMethod: %s\n", ctx.AuthMethod)
+		}
+		if ctx.Namespace != "" {
+			_, _ = fmt.Fprintf(w, "  Namespace:  %s\n", ctx.Namespace)
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+
 	if !result.Allowed {
 		_, _ = fmt.Fprintf(w, "DENIED: No RBAC rules grant %s %s to %s\n",
 			result.Request.Verb,
@@ -125,13 +156,25 @@ func formatRule(rule rbacv1.PolicyRule) string {
 	return strings.Join(parts, ", ")
 }
 
+// ContextOutput is the structure for context info in JSON/YAML output
+type ContextOutput struct {
+	ContextName string   `json:"contextName"`
+	ClusterName string   `json:"clusterName"`
+	AuthInfo    string   `json:"authInfo"`
+	UserName    string   `json:"userName"`
+	Groups      []string `json:"groups,omitempty"`
+	AuthMethod  string   `json:"authMethod,omitempty"`
+	Namespace   string   `json:"namespace,omitempty"`
+}
+
 // JSONOutput is the structure for JSON output
 type JSONOutput struct {
-	Allowed bool          `json:"allowed"`
-	Subject SubjectOutput `json:"subject"`
-	Request RequestOutput `json:"request"`
-	Grants  []GrantOutput `json:"grants,omitempty"`
-	Errors  []string      `json:"errors,omitempty"`
+	Context *ContextOutput `json:"context,omitempty"`
+	Allowed bool           `json:"allowed"`
+	Subject SubjectOutput  `json:"subject"`
+	Request RequestOutput  `json:"request"`
+	Grants  []GrantOutput  `json:"grants,omitempty"`
+	Errors  []string       `json:"errors,omitempty"`
 }
 
 type SubjectOutput struct {
@@ -178,7 +221,7 @@ type RuleOutput struct {
 // JSONPrinter outputs JSON format
 type JSONPrinter struct{}
 
-func (p *JSONPrinter) Print(w io.Writer, result *rbac.PermissionResult) error {
+func (p *JSONPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *ContextInfo) error {
 	output := JSONOutput{
 		Allowed: result.Allowed,
 		Subject: SubjectOutput{
@@ -195,6 +238,19 @@ func (p *JSONPrinter) Print(w io.Writer, result *rbac.PermissionResult) error {
 			Namespace:    result.Request.Namespace,
 		},
 		Grants: make([]GrantOutput, 0, len(result.Grants)),
+	}
+
+	// Include context info if --as was not provided
+	if ctx != nil {
+		output.Context = &ContextOutput{
+			ContextName: ctx.ContextName,
+			ClusterName: ctx.ClusterName,
+			AuthInfo:    ctx.AuthInfo,
+			UserName:    ctx.UserName,
+			Groups:      ctx.Groups,
+			AuthMethod:  ctx.AuthMethod,
+			Namespace:   ctx.Namespace,
+		}
 	}
 
 	for _, grant := range result.Grants {
@@ -232,7 +288,7 @@ func (p *JSONPrinter) Print(w io.Writer, result *rbac.PermissionResult) error {
 // YAMLPrinter outputs YAML format
 type YAMLPrinter struct{}
 
-func (p *YAMLPrinter) Print(w io.Writer, result *rbac.PermissionResult) error {
+func (p *YAMLPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *ContextInfo) error {
 	output := JSONOutput{
 		Allowed: result.Allowed,
 		Subject: SubjectOutput{
@@ -249,6 +305,19 @@ func (p *YAMLPrinter) Print(w io.Writer, result *rbac.PermissionResult) error {
 			Namespace:    result.Request.Namespace,
 		},
 		Grants: make([]GrantOutput, 0, len(result.Grants)),
+	}
+
+	// Include context info if --as was not provided
+	if ctx != nil {
+		output.Context = &ContextOutput{
+			ContextName: ctx.ContextName,
+			ClusterName: ctx.ClusterName,
+			AuthInfo:    ctx.AuthInfo,
+			UserName:    ctx.UserName,
+			Groups:      ctx.Groups,
+			AuthMethod:  ctx.AuthMethod,
+			Namespace:   ctx.Namespace,
+		}
 	}
 
 	for _, grant := range result.Grants {
