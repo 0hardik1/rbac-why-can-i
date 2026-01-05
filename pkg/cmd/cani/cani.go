@@ -86,24 +86,13 @@ func NewCmdRbacWhy(streams genericclioptions.IOStreams) *cobra.Command {
 	// Add our custom flags
 	cmd.Flags().StringVarP(&o.Output, "output", "o", "text", "Output format: text, json, yaml, dot, mermaid")
 	cmd.Flags().BoolVar(&o.ShowRisky, "show-risky", false, "Analyze and show risky permissions for the subject")
+	cmd.Flags().StringVarP(&o.AWSProfile, "profile", "p", "", "AWS profile to use for authentication (for EKS clusters)")
 
 	return cmd
 }
 
 // Run executes the rbac-why command
 func (o *RbacWhyOptions) Run(ctx context.Context) error {
-	// Parse the subject
-	subject, err := rbac.ParseSubject(o.As)
-	if err != nil {
-		return fmt.Errorf("failed to parse subject: %w", err)
-	}
-
-	// If we extracted groups from the current context (e.g., from client certificate),
-	// add them to the subject so they're used in RBAC resolution
-	if !o.AsProvided && o.CurrentContext != nil && len(o.CurrentContext.Groups) > 0 {
-		subject.Groups = o.CurrentContext.Groups
-	}
-
 	// Create Kubernetes client WITHOUT impersonation
 	// We need to read RBAC resources with the actual user's permissions,
 	// not as the subject being checked
@@ -126,6 +115,38 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 	o.ConfigFlags.Impersonate = savedImpersonate
 	o.ConfigFlags.ImpersonateGroup = savedImpersonateGroup
 	o.ConfigFlags.ImpersonateUID = savedImpersonateUID
+
+	// For AWS IAM auth, resolve the actual K8s identity from aws-auth ConfigMap
+	if !o.AsProvided && o.CurrentContext != nil && o.CurrentContext.AuthMethod == "aws-iam" && o.CurrentContext.AWSIamArn != "" {
+		identity, err := ResolveAWSAuthIdentity(ctx, restConfig, o.CurrentContext.AWSIamArn)
+		if err != nil {
+			// Log warning but continue with IAM ARN as username
+			_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to read aws-auth ConfigMap: %v\n", err)
+			_, _ = fmt.Fprintf(o.ErrOut, "Using IAM ARN as username: %s\n", o.CurrentContext.AWSIamArn)
+		} else {
+			// Update context and subject with resolved identity
+			o.CurrentContext.UserName = identity.Username
+			o.CurrentContext.Groups = identity.Groups
+			o.As = identity.Username
+			if identity.Found {
+				o.CurrentContext.AuthMethod = "aws-iam (via aws-auth)"
+			} else {
+				o.CurrentContext.AuthMethod = "aws-iam (not in aws-auth)"
+			}
+		}
+	}
+
+	// Parse the subject
+	subject, err := rbac.ParseSubject(o.As)
+	if err != nil {
+		return fmt.Errorf("failed to parse subject: %w", err)
+	}
+
+	// If we extracted groups from the current context (e.g., from client certificate or aws-auth),
+	// add them to the subject so they're used in RBAC resolution
+	if !o.AsProvided && o.CurrentContext != nil && len(o.CurrentContext.Groups) > 0 {
+		subject.Groups = o.CurrentContext.Groups
+	}
 
 	rbacClient, err := client.NewK8sRBACClient(restConfig)
 	if err != nil {
