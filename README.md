@@ -131,15 +131,21 @@ This tool answers the question: **"Why can this subject perform this action?"** 
 ## Installation
 
 ```bash
-# Build from source
-make build
-
-# Install to GOBIN
-make install
+# Build, install to GOBIN, and verify kubectl plugin discovery
+make kubectl-setup
 
 # The plugin is now available as:
 kubectl rbac-why can-i --as <subject> <verb> <resource>
 ```
+
+If you'd rather run the steps manually:
+
+```bash
+make build      # build to ./bin/kubectl-rbac_why
+make install    # copy to $GOBIN
+```
+
+`$GOBIN` (or `$GOPATH/bin`) must be on your `PATH` for kubectl to discover the plugin.
 
 ## Usage
 
@@ -193,6 +199,25 @@ kubectl rbac-why can-i get pods -o dot | dot -Tpng > rbac.png
 kubectl rbac-why can-i get pods -o mermaid
 ```
 
+### EKS / AWS Authentication
+
+`kubectl rbac-why` talks to your cluster through the active kubeconfig context. On EKS, that context typically uses `aws eks get-token` as exec-auth, which needs working AWS credentials — and the plugin itself also calls EKS APIs (Access Entries, Pod Identity) to enrich its output.
+
+If you have more than one AWS profile configured (the common case), **export `AWS_PROFILE` before running the plugin** so both `aws eks get-token` / `aws sts get-caller-identity` and the plugin's own EKS API calls pick the right credentials:
+
+```bash
+export AWS_PROFILE=my-eks-profile
+kubectl rbac-why can-i get secrets -n default
+```
+
+Or pass `--profile` (`-p`) per invocation:
+
+```bash
+kubectl rbac-why can-i -p my-eks-profile get secrets -n default
+```
+
+Without a usable profile, the plugin falls back to the kubeconfig user name and skips EKS-side identity lookups; basic RBAC tracing still works, but the output won't include EKS Access Entry / Pod Identity context.
+
 ### Risky Permissions Analysis
 
 Analyze permissions for potentially dangerous patterns:
@@ -218,7 +243,7 @@ This detects risky permissions such as:
 
 ### Prerequisites
 
-- Go 1.21+
+- Go 1.25+
 - kubectl configured with a cluster
 - kind (for e2e tests)
 
