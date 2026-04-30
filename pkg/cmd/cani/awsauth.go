@@ -2,14 +2,22 @@ package cani
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"gopkg.in/yaml.v3"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
+
+// ErrAwsAuthNotFound is returned by ResolveAWSAuthIdentity when the aws-auth
+// ConfigMap is absent from kube-system. On modern EKS clusters that use only
+// Access Entries this is a normal condition; the caller should silently
+// advance the resolution chain rather than warn.
+var ErrAwsAuthNotFound = errors.New("aws-auth ConfigMap not found")
 
 // AWSAuthMapping represents a mapping entry in the aws-auth ConfigMap
 type AWSAuthMapping struct {
@@ -37,6 +45,9 @@ func ResolveAWSAuthIdentity(ctx context.Context, restConfig *rest.Config, iamArn
 	// Read the aws-auth ConfigMap from kube-system namespace
 	cm, err := clientset.CoreV1().ConfigMaps("kube-system").Get(ctx, "aws-auth", metav1.GetOptions{})
 	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, ErrAwsAuthNotFound
+		}
 		return nil, fmt.Errorf("failed to get aws-auth ConfigMap: %w", err)
 	}
 
@@ -107,36 +118,6 @@ func findMappingForArn(mappings []AWSAuthMapping, iamArn string, isRoleMapping b
 	}
 
 	return nil
-}
-
-// matchesAssumedRole checks if an assumed-role ARN matches a role ARN
-// roleArn: arn:aws:iam::123456789012:role/my-role
-// assumedRoleArn: arn:aws:sts::123456789012:assumed-role/my-role[/session-name]
-func matchesAssumedRole(roleArn, assumedRoleArn string) bool {
-	// Extract role name from role ARN
-	// Format: arn:aws:iam::ACCOUNT:role/ROLE-NAME or arn:aws:iam::ACCOUNT:role/PATH/ROLE-NAME
-	roleArnParts := strings.Split(roleArn, ":role/")
-	if len(roleArnParts) != 2 {
-		return false
-	}
-	roleName := roleArnParts[1]
-	// Handle paths in role name (e.g., "path/to/role-name" -> "role-name")
-	if idx := strings.LastIndex(roleName, "/"); idx != -1 {
-		roleName = roleName[idx+1:]
-	}
-
-	// Extract account from role ARN
-	arnParts := strings.Split(roleArn, ":")
-	if len(arnParts) < 5 {
-		return false
-	}
-	account := arnParts[4]
-
-	// Check if assumed-role ARN matches the pattern
-	// Format: arn:aws:sts::ACCOUNT:assumed-role/ROLE-NAME[/SESSION-NAME]
-	expectedPrefix := fmt.Sprintf("arn:aws:sts::%s:assumed-role/%s", account, roleName)
-	return assumedRoleArn == expectedPrefix ||
-		strings.HasPrefix(assumedRoleArn, expectedPrefix+"/")
 }
 
 // resolveUsername handles the username template variables

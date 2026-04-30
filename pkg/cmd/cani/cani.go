@@ -2,15 +2,21 @@ package cani
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/client-go/rest"
 
 	"github.com/hardik/kubectl-rbac-why/pkg/client"
 	"github.com/hardik/kubectl-rbac-why/pkg/output"
 	"github.com/hardik/kubectl-rbac-why/pkg/rbac"
 )
+
+// eksClientFactory builds the EKS API client used by the orchestration
+// chain. Overridable in tests.
+var eksClientFactory = NewEKSClient
 
 var (
 	longDesc = `Explains why a permission is granted in Kubernetes RBAC.
@@ -87,6 +93,9 @@ func NewCmdRbacWhy(streams genericclioptions.IOStreams) *cobra.Command {
 	cmd.Flags().StringVarP(&o.Output, "output", "o", "text", "Output format: text, json, yaml, dot, mermaid")
 	cmd.Flags().BoolVar(&o.ShowRisky, "show-risky", false, "Analyze and show risky permissions for the subject")
 	cmd.Flags().StringVarP(&o.AWSProfile, "profile", "p", "", "AWS profile to use for authentication (for EKS clusters)")
+	cmd.Flags().StringVar(&o.ClusterName, "cluster-name", "", "EKS cluster name (overrides auto-detection from kubeconfig)")
+	cmd.Flags().StringVar(&o.AWSRegion, "region", "", "AWS region for EKS API calls (overrides auto-detection)")
+	cmd.Flags().BoolVar(&o.SkipEKS, "skip-eks-lookup", false, "Skip EKS Access Entries and Pod Identity lookups")
 
 	return cmd
 }
@@ -116,30 +125,33 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 	o.ConfigFlags.ImpersonateGroup = savedImpersonateGroup
 	o.ConfigFlags.ImpersonateUID = savedImpersonateUID
 
-	// For AWS IAM auth, resolve the actual K8s identity from aws-auth ConfigMap
+	// Build an EKS client once and reuse it for both identity resolution
+	// and ServiceAccount enrichment. nil if EKS isn't applicable (no
+	// cluster name, --skip-eks-lookup, or AWS config error).
+	eksClient := o.maybeBuildEKSClient(ctx)
+
+	// For AWS IAM auth, resolve the K8s identity by walking the priority
+	// chain: Access Entry → aws-auth → Pod Identity → raw IAM ARN.
 	if !o.AsProvided && o.CurrentContext != nil && o.CurrentContext.AuthMethod == "aws-iam" && o.CurrentContext.AWSIamArn != "" {
-		identity, err := ResolveAWSAuthIdentity(ctx, restConfig, o.CurrentContext.AWSIamArn)
-		if err != nil {
-			// Log warning but continue with IAM ARN as username
-			_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to read aws-auth ConfigMap: %v\n", err)
-			_, _ = fmt.Fprintf(o.ErrOut, "Using IAM ARN as username: %s\n", o.CurrentContext.AWSIamArn)
-		} else {
-			// Update context and subject with resolved identity
-			o.CurrentContext.UserName = identity.Username
-			o.CurrentContext.Groups = identity.Groups
-			o.As = identity.Username
-			if identity.Found {
-				o.CurrentContext.AuthMethod = "aws-iam (via aws-auth)"
-			} else {
-				o.CurrentContext.AuthMethod = "aws-iam (not in aws-auth)"
-			}
-		}
+		o.orchestrateAWSIdentity(ctx, restConfig, eksClient)
 	}
 
 	// Parse the subject
 	subject, err := rbac.ParseSubject(o.As)
 	if err != nil {
 		return fmt.Errorf("failed to parse subject: %w", err)
+	}
+
+	// Pod Identity enrichment: when the resolved subject is a
+	// ServiceAccount, surface any IAM role(s) bound to it. Informational —
+	// doesn't affect RBAC resolution.
+	if eksClient != nil && o.CurrentContext != nil && subject.Kind == "ServiceAccount" && o.CurrentContext.EKSClusterName != "" {
+		assocs, err := FindPodIdentityForServiceAccount(ctx, eksClient, o.CurrentContext.EKSClusterName, subject.Namespace, subject.Name)
+		if err != nil {
+			_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to list Pod Identity associations for service account: %v\n", err)
+		} else {
+			o.CurrentContext.PodIdentityForSA = assocs
+		}
 	}
 
 	// If we extracted groups from the current context (e.g., from client certificate or aws-auth),
@@ -176,18 +188,156 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 	// Convert context info for output if using current context
 	var ctxInfo *output.ContextInfo
 	if !o.AsProvided && o.CurrentContext != nil {
-		ctxInfo = &output.ContextInfo{
-			ContextName: o.CurrentContext.ContextName,
-			ClusterName: o.CurrentContext.ClusterName,
-			AuthInfo:    o.CurrentContext.AuthInfo,
-			UserName:    o.CurrentContext.UserName,
-			Groups:      o.CurrentContext.Groups,
-			AuthMethod:  o.CurrentContext.AuthMethod,
-			Namespace:   o.CurrentContext.Namespace,
-		}
+		ctxInfo = toOutputContextInfo(o.CurrentContext)
 	}
 
 	return printer.Print(o.Out, result, ctxInfo)
+}
+
+// toOutputContextInfo translates the cani-internal ContextInfo (which holds
+// SDK-typed AccessPolicy/PodIdentity values) into the output package's
+// SDK-free representation so pkg/output stays decoupled from the AWS SDK.
+func toOutputContextInfo(c *ContextInfo) *output.ContextInfo {
+	if c == nil {
+		return nil
+	}
+	out := &output.ContextInfo{
+		ContextName:    c.ContextName,
+		ClusterName:    c.ClusterName,
+		AuthInfo:       c.AuthInfo,
+		UserName:       c.UserName,
+		Groups:         c.Groups,
+		AuthMethod:     c.AuthMethod,
+		Namespace:      c.Namespace,
+		EKSClusterName: c.EKSClusterName,
+	}
+	for _, ap := range c.AccessPolicies {
+		out.AccessPolicies = append(out.AccessPolicies, output.AccessPolicyInfo{
+			PolicyARN:  ap.PolicyARN,
+			ScopeType:  ap.ScopeType,
+			Namespaces: ap.Namespaces,
+		})
+	}
+	if c.PodIdentityForRole != nil {
+		out.PodIdentityForRole = &output.PodIdentityInfo{
+			AssociationID:  c.PodIdentityForRole.AssociationID,
+			Namespace:      c.PodIdentityForRole.Namespace,
+			ServiceAccount: c.PodIdentityForRole.ServiceAccount,
+			RoleARN:        c.PodIdentityForRole.RoleARN,
+		}
+	}
+	for _, p := range c.PodIdentityForSA {
+		out.PodIdentityForSA = append(out.PodIdentityForSA, output.PodIdentityInfo{
+			AssociationID:  p.AssociationID,
+			Namespace:      p.Namespace,
+			ServiceAccount: p.ServiceAccount,
+			RoleARN:        p.RoleARN,
+		})
+	}
+	return out
+}
+
+// maybeBuildEKSClient constructs an EKSAPI client when an EKS cluster
+// identity is known and EKS lookups aren't disabled. Returns nil (with a
+// warning to ErrOut on actual failure) so callers can simply check for
+// nil and skip EKS-specific code paths.
+func (o *RbacWhyOptions) maybeBuildEKSClient(ctx context.Context) EKSAPI {
+	if o.SkipEKS || o.CurrentContext == nil {
+		return nil
+	}
+	if o.CurrentContext.EKSClusterName == "" || o.CurrentContext.EKSRegion == "" {
+		return nil
+	}
+	client, err := eksClientFactory(ctx, o.AWSProfile, o.CurrentContext.EKSRegion)
+	if err != nil {
+		_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to build EKS client (%v); skipping Access Entries and Pod Identity lookups\n", err)
+		return nil
+	}
+	return client
+}
+
+// orchestrateAWSIdentity resolves the K8s identity for an AWS IAM-authenticated
+// caller by walking the priority chain:
+//
+//  1. EKS Access Entries (modern; via DescribeAccessEntry)
+//  2. aws-auth ConfigMap (legacy)
+//  3. EKS Pod Identity reverse-lookup (when the IAM principal is a role
+//     bound to a ServiceAccount via Pod Identity)
+//  4. Raw IAM ARN (fallback — same as today's behavior)
+//
+// On any per-step error other than "not found", a one-line warning goes to
+// ErrOut and resolution falls through to the next step. The function never
+// returns an error — failures degrade gracefully, preserving today's
+// behavior on non-EKS clusters and clusters without EKS API permissions.
+func (o *RbacWhyOptions) orchestrateAWSIdentity(ctx context.Context, restConfig *rest.Config, eksClient EKSAPI) {
+	arn := o.CurrentContext.AWSIamArn
+	clusterName := o.CurrentContext.EKSClusterName
+
+	// 1. EKS Access Entries
+	if eksClient != nil && clusterName != "" {
+		ae, err := ResolveAccessEntryIdentity(ctx, eksClient, clusterName, arn)
+		if err != nil {
+			_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to query EKS Access Entries: %v\n", err)
+		} else if ae.Found {
+			o.As = ae.KubernetesUsername
+			o.CurrentContext.UserName = ae.KubernetesUsername
+			o.CurrentContext.Groups = ae.KubernetesGroups
+			o.CurrentContext.AuthMethod = "aws-iam (via Access Entry)"
+			o.CurrentContext.AccessEntryFound = true
+			o.CurrentContext.AccessPolicies = ae.AccessPolicies
+			return
+		}
+	}
+
+	// 2. aws-auth ConfigMap
+	identity, err := ResolveAWSAuthIdentity(ctx, restConfig, arn)
+	switch {
+	case err == nil && identity.Found:
+		o.As = identity.Username
+		o.CurrentContext.UserName = identity.Username
+		o.CurrentContext.Groups = identity.Groups
+		o.CurrentContext.AuthMethod = "aws-iam (via aws-auth)"
+		return
+	case err == nil && !identity.Found:
+		// aws-auth exists but has no entry for this principal; advance
+		// to Pod Identity reverse-lookup before giving up.
+	case errors.Is(err, ErrAwsAuthNotFound):
+		// Modern EKS clusters use Access Entries only and have no
+		// aws-auth ConfigMap. This is normal — no warning.
+	default:
+		_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to read aws-auth ConfigMap: %v\n", err)
+	}
+
+	// 3. Pod Identity reverse-lookup (IAM role → ServiceAccount).
+	// Only meaningful when the caller is acting as an IAM role.
+	if eksClient != nil && clusterName != "" {
+		if matches, perr := FindPodIdentityByRole(ctx, eksClient, clusterName, arn); perr != nil {
+			_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to scan Pod Identity associations: %v\n", perr)
+		} else if len(matches) == 1 {
+			m := matches[0]
+			o.As = "system:serviceaccount:" + m.Namespace + ":" + m.ServiceAccount
+			o.CurrentContext.UserName = o.As
+			o.CurrentContext.Groups = nil
+			o.CurrentContext.AuthMethod = "aws-iam (via Pod Identity)"
+			o.CurrentContext.PodIdentityForRole = &m
+			return
+		} else if len(matches) > 1 {
+			_, _ = fmt.Fprintf(o.ErrOut, "Warning: %d Pod Identity associations match this IAM role; ambiguous — falling back to raw IAM ARN\n", len(matches))
+		}
+	}
+
+	// 4. Raw IAM ARN fallback
+	if identity != nil && !identity.Found {
+		// aws-auth was readable but had no mapping
+		o.As = identity.Username
+		o.CurrentContext.UserName = identity.Username
+		o.CurrentContext.Groups = identity.Groups
+		o.CurrentContext.AuthMethod = "aws-iam (no mapping found)"
+		return
+	}
+	o.As = arn
+	o.CurrentContext.UserName = arn
+	o.CurrentContext.AuthMethod = "aws-iam (no mapping found)"
 }
 
 // runRiskyAnalysis shows risky permissions for a subject

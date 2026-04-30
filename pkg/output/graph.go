@@ -21,6 +21,7 @@ func (p *DotPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Cont
 	// Add context info as a comment if using current context
 	if ctx != nil {
 		_, _ = fmt.Fprintf(w, "  // Context: %s, Cluster: %s, User: %s\n", ctx.ContextName, ctx.ClusterName, ctx.UserName)
+		writeAWSIdentityComments(w, ctx, "  // ")
 	}
 	_, _ = fmt.Fprintln(w)
 
@@ -81,6 +82,7 @@ func (p *MermaidPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *
 	// Add context info as a comment if using current context
 	if ctx != nil {
 		_, _ = fmt.Fprintf(w, "%%%% Context: %s, Cluster: %s, User: %s\n", ctx.ContextName, ctx.ClusterName, ctx.UserName)
+		writeAWSIdentityComments(w, ctx, "%% ")
 	}
 	_, _ = fmt.Fprintln(w, "graph LR")
 
