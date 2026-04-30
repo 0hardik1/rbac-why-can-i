@@ -22,6 +22,29 @@ type ContextInfo struct {
 	Groups      []string // Groups the user belongs to (e.g., O from cert)
 	Namespace   string
 	AuthMethod  string // e.g., "client-certificate", "token", "exec", etc.
+
+	// EKS-specific informational fields. All optional and zero by default.
+	EKSClusterName     string
+	AccessPolicies     []AccessPolicyInfo // EKS-managed access policies attached to the principal's Access Entry
+	PodIdentityForRole *PodIdentityInfo   // when the IAM role mapped to a SA via Pod Identity
+	PodIdentityForSA   []PodIdentityInfo  // any Pod Identity associations bound to this SA
+}
+
+// AccessPolicyInfo describes an EKS-managed access policy attached to an
+// Access Entry. These policies grant Kubernetes permissions out-of-band of
+// the standard (Cluster)RoleBinding chain.
+type AccessPolicyInfo struct {
+	PolicyARN  string   `json:"policyArn"`
+	ScopeType  string   `json:"scopeType"`            // "cluster" or "namespace"
+	Namespaces []string `json:"namespaces,omitempty"` // populated when ScopeType is "namespace"
+}
+
+// PodIdentityInfo describes an EKS Pod Identity Association.
+type PodIdentityInfo struct {
+	AssociationID  string `json:"associationId"`
+	Namespace      string `json:"namespace"`
+	ServiceAccount string `json:"serviceAccount"`
+	RoleARN        string `json:"roleArn"`
 }
 
 // Printer interface for different output formats
@@ -68,6 +91,7 @@ func (p *TextPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Con
 			_, _ = fmt.Fprintf(w, "  Namespace:  %s\n", ctx.Namespace)
 		}
 		_, _ = fmt.Fprintln(w)
+		writeAWSIdentityContext(w, ctx)
 	}
 
 	if !result.Allowed {
@@ -158,13 +182,104 @@ func formatRule(rule rbacv1.PolicyRule) string {
 
 // ContextOutput is the structure for context info in JSON/YAML output
 type ContextOutput struct {
-	ContextName string   `json:"contextName"`
-	ClusterName string   `json:"clusterName"`
-	AuthInfo    string   `json:"authInfo"`
-	UserName    string   `json:"userName"`
-	Groups      []string `json:"groups,omitempty"`
-	AuthMethod  string   `json:"authMethod,omitempty"`
-	Namespace   string   `json:"namespace,omitempty"`
+	ContextName        string             `json:"contextName"`
+	ClusterName        string             `json:"clusterName"`
+	AuthInfo           string             `json:"authInfo"`
+	UserName           string             `json:"userName"`
+	Groups             []string           `json:"groups,omitempty"`
+	AuthMethod         string             `json:"authMethod,omitempty"`
+	Namespace          string             `json:"namespace,omitempty"`
+	EKSClusterName     string             `json:"eksClusterName,omitempty"`
+	AccessPolicies     []AccessPolicyInfo `json:"accessPolicies,omitempty"`
+	PodIdentityForRole *PodIdentityInfo   `json:"podIdentityForRole,omitempty"`
+	PodIdentityForSA   []PodIdentityInfo  `json:"podIdentityForServiceAccount,omitempty"`
+}
+
+// contextOutputFromInfo copies the public fields from ContextInfo into the
+// JSON-serialisable ContextOutput. The AuthInfo-side fields are preserved
+// by value (slices not deep-copied).
+func contextOutputFromInfo(ctx *ContextInfo) *ContextOutput {
+	if ctx == nil {
+		return nil
+	}
+	return &ContextOutput{
+		ContextName:        ctx.ContextName,
+		ClusterName:        ctx.ClusterName,
+		AuthInfo:           ctx.AuthInfo,
+		UserName:           ctx.UserName,
+		Groups:             ctx.Groups,
+		AuthMethod:         ctx.AuthMethod,
+		Namespace:          ctx.Namespace,
+		EKSClusterName:     ctx.EKSClusterName,
+		AccessPolicies:     ctx.AccessPolicies,
+		PodIdentityForRole: ctx.PodIdentityForRole,
+		PodIdentityForSA:   ctx.PodIdentityForSA,
+	}
+}
+
+// writeAWSIdentityComments renders the EKS context as comment lines for
+// graph formats (DOT, Mermaid). prefix is the format-specific comment
+// marker, e.g. "  // " for DOT or "%% " for Mermaid. No-op when no EKS
+// fields are populated.
+func writeAWSIdentityComments(w io.Writer, ctx *ContextInfo, prefix string) {
+	if ctx == nil {
+		return
+	}
+	if ctx.EKSClusterName != "" {
+		_, _ = fmt.Fprintf(w, "%sEKS Cluster: %s\n", prefix, ctx.EKSClusterName)
+	}
+	if ctx.PodIdentityForRole != nil {
+		p := ctx.PodIdentityForRole
+		_, _ = fmt.Fprintf(w, "%sPod Identity (role -> SA): %s/%s\n", prefix, p.Namespace, p.ServiceAccount)
+	}
+	for _, ap := range ctx.AccessPolicies {
+		_, _ = fmt.Fprintf(w, "%sAccess Policy: %s (scope=%s)\n", prefix, ap.PolicyARN, ap.ScopeType)
+	}
+	for _, p := range ctx.PodIdentityForSA {
+		_, _ = fmt.Fprintf(w, "%sPod Identity (SA -> role): %s\n", prefix, p.RoleARN)
+	}
+}
+
+// writeAWSIdentityContext renders the EKS-specific informational block
+// after the standard context block in text output. No-op if no EKS fields
+// are populated.
+func writeAWSIdentityContext(w io.Writer, ctx *ContextInfo) {
+	if ctx == nil {
+		return
+	}
+	hasEKS := ctx.EKSClusterName != "" ||
+		len(ctx.AccessPolicies) > 0 ||
+		ctx.PodIdentityForRole != nil ||
+		len(ctx.PodIdentityForSA) > 0
+	if !hasEKS {
+		return
+	}
+	_, _ = fmt.Fprintln(w, "AWS / EKS identity:")
+	if ctx.EKSClusterName != "" {
+		_, _ = fmt.Fprintf(w, "  EKS Cluster: %s\n", ctx.EKSClusterName)
+	}
+	if ctx.PodIdentityForRole != nil {
+		p := ctx.PodIdentityForRole
+		_, _ = fmt.Fprintf(w, "  Pod Identity (IAM role -> ServiceAccount): %s/%s (associationId=%s)\n",
+			p.Namespace, p.ServiceAccount, p.AssociationID)
+	}
+	if len(ctx.AccessPolicies) > 0 {
+		_, _ = fmt.Fprintln(w, "  EKS-managed access policies (granted out-of-band by EKS, not part of RBAC walker):")
+		for _, ap := range ctx.AccessPolicies {
+			scope := ap.ScopeType
+			if scope == "namespace" && len(ap.Namespaces) > 0 {
+				scope = "namespace=[" + strings.Join(ap.Namespaces, ",") + "]"
+			}
+			_, _ = fmt.Fprintf(w, "    - %s (scope: %s)\n", ap.PolicyARN, scope)
+		}
+	}
+	if len(ctx.PodIdentityForSA) > 0 {
+		_, _ = fmt.Fprintln(w, "  Pod Identity associations for this ServiceAccount:")
+		for _, p := range ctx.PodIdentityForSA {
+			_, _ = fmt.Fprintf(w, "    - role: %s (associationId=%s)\n", p.RoleARN, p.AssociationID)
+		}
+	}
+	_, _ = fmt.Fprintln(w)
 }
 
 // JSONOutput is the structure for JSON output
@@ -242,15 +357,7 @@ func (p *JSONPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Con
 
 	// Include context info if --as was not provided
 	if ctx != nil {
-		output.Context = &ContextOutput{
-			ContextName: ctx.ContextName,
-			ClusterName: ctx.ClusterName,
-			AuthInfo:    ctx.AuthInfo,
-			UserName:    ctx.UserName,
-			Groups:      ctx.Groups,
-			AuthMethod:  ctx.AuthMethod,
-			Namespace:   ctx.Namespace,
-		}
+		output.Context = contextOutputFromInfo(ctx)
 	}
 
 	for _, grant := range result.Grants {
@@ -309,15 +416,7 @@ func (p *YAMLPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Con
 
 	// Include context info if --as was not provided
 	if ctx != nil {
-		output.Context = &ContextOutput{
-			ContextName: ctx.ContextName,
-			ClusterName: ctx.ClusterName,
-			AuthInfo:    ctx.AuthInfo,
-			UserName:    ctx.UserName,
-			Groups:      ctx.Groups,
-			AuthMethod:  ctx.AuthMethod,
-			Namespace:   ctx.Namespace,
-		}
+		output.Context = contextOutputFromInfo(ctx)
 	}
 
 	for _, grant := range result.Grants {

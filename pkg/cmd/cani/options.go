@@ -26,6 +26,14 @@ type ContextInfo struct {
 	Namespace   string
 	AuthMethod  string // e.g., "client-certificate", "token", "exec", etc.
 	AWSIamArn   string // For AWS IAM auth: the IAM ARN before aws-auth mapping
+
+	// EKS-specific fields (populated when running against an EKS cluster).
+	EKSClusterName     string
+	EKSRegion          string
+	AccessEntryFound   bool
+	AccessPolicies     []AccessPolicyAssociation
+	PodIdentityForRole *PodIdentityAssociation  // populated by IAM-role reverse lookup
+	PodIdentityForSA   []PodIdentityAssociation // populated by SA enrichment
 }
 
 // RbacWhyOptions contains the options for the rbac-why command
@@ -53,7 +61,10 @@ type RbacWhyOptions struct {
 	ShowRisky bool
 
 	// AWS options
-	AWSProfile string // AWS profile to use for authentication
+	AWSProfile  string // AWS profile to use for authentication
+	ClusterName string // EKS cluster name override (--cluster-name)
+	AWSRegion   string // AWS region override (--region)
+	SkipEKS     bool   // skip EKS API lookups (--skip-eks-lookup)
 
 	// Kubernetes config
 	ConfigFlags *genericclioptions.ConfigFlags
@@ -155,6 +166,20 @@ func (o *RbacWhyOptions) completeFromCurrentContext() error {
 	// For AWS IAM auth, store the IAM ARN for later aws-auth lookup
 	if authMethod == "aws-iam" {
 		o.CurrentContext.AWSIamArn = userName
+	}
+
+	// Derive EKS cluster identity from kubeconfig (used by Access Entries
+	// and Pod Identity lookups). User-supplied --cluster-name / --region
+	// flags take precedence and are applied here.
+	if id, ok := DeriveClusterIdentity(rawConfig, currentContextName); ok {
+		o.CurrentContext.EKSClusterName = id.ClusterName
+		o.CurrentContext.EKSRegion = id.Region
+	}
+	if o.ClusterName != "" {
+		o.CurrentContext.EKSClusterName = o.ClusterName
+	}
+	if o.AWSRegion != "" {
+		o.CurrentContext.EKSRegion = o.AWSRegion
 	}
 
 	// Use the extracted user name as the subject
@@ -350,27 +375,6 @@ func extractProfileFromArgs(args []string) string {
 		}
 	}
 	return ""
-}
-
-// convertRoleToAssumedRoleArn converts a role ARN to the assumed-role ARN format
-// that Kubernetes uses as the username
-// Input:  arn:aws:iam::123456789012:role/my-role
-// Output: arn:aws:sts::123456789012:assumed-role/my-role/*
-// Note: We use * as session name placeholder since we can't know the exact session
-func convertRoleToAssumedRoleArn(roleArn, accountId string) string {
-	// Extract role name from role ARN
-	// Format: arn:aws:iam::ACCOUNT:role/ROLE-NAME
-	parts := strings.Split(roleArn, "/")
-	if len(parts) < 2 {
-		return roleArn // Return as-is if we can't parse
-	}
-	roleName := parts[len(parts)-1]
-
-	// Construct assumed-role ARN
-	// When checking RBAC, aws-auth configmap typically maps to:
-	// arn:aws:sts::ACCOUNT:assumed-role/ROLE-NAME/SESSION
-	// For RBAC lookup, we need to check as the user would appear
-	return fmt.Sprintf("arn:aws:sts::%s:assumed-role/%s", accountId, roleName)
 }
 
 // parseResource parses a resource string like "pods", "pods/log", "deployments.apps"
