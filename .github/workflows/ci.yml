@@ -79,4 +79,6 @@ jobs:
         run: kubectl apply -f test/e2e/testdata/manifests/
 
       - name: Run e2e tests
-        run: RBAC_WHY_BINARY=./bin/kubectl-rbac_why go test -v -timeout 30m ./test/e2e/...
+        # Absolute path: `go test` runs with its working directory set to the
+        # package dir (test/e2e), so a relative ./bin path would not resolve.
+        run: RBAC_WHY_BINARY="$GITHUB_WORKSPACE/bin/kubectl-rbac_why" go test -v -timeout 30m ./test/e2e/...
