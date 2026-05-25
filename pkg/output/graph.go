@@ -29,7 +29,7 @@ func (p *DotPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Cont
 		_, _ = fmt.Fprintf(w, "  denied [label=\"DENIED\\n%s cannot %s %s\" shape=octagon style=filled fillcolor=red fontcolor=white];\n",
 			escapeLabel(result.Subject.String()),
 			result.Request.Verb,
-			result.Request.Resource)
+			result.Request.FullResource())
 		_, _ = fmt.Fprintln(w, "}")
 		return nil
 	}
@@ -90,7 +90,7 @@ func (p *MermaidPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *
 		_, _ = fmt.Fprintf(w, "  denied{{DENIED: %s cannot %s %s}}\n",
 			escapeMermaid(result.Subject.String()),
 			result.Request.Verb,
-			result.Request.Resource)
+			result.Request.FullResource())
 		_, _ = fmt.Fprintln(w, "  style denied fill:#f66,stroke:#333,color:#fff")
 		return nil
 	}

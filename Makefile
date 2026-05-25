@@ -11,7 +11,7 @@ GOBIN := $(shell go env GOPATH)/bin
 endif
 
 # Tool versions
-GOLANGCI_LINT_VERSION := v1.55.2
+GOLANGCI_LINT_VERSION := v2.12.2
 KIND_VERSION := v0.20.0
 
 .PHONY: all
@@ -104,7 +104,7 @@ deps-update: ## Update dependencies
 .PHONY: tools
 tools: ## Install development tools
 	@echo "Installing golangci-lint..."
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
+	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)
 	@echo "Installing kind..."
 	go install sigs.k8s.io/kind@$(KIND_VERSION)
 
@@ -133,6 +133,9 @@ e2e: ## Complete e2e workflow: create kind cluster, setup, test, and cleanup
 	@echo ""
 	@echo "Step 1/5: Creating kind cluster..."
 	@kind get clusters | grep -q rbac-why-dev || $(MAKE) kind-create
+	@# Always target the kind cluster: applying fixtures + tests to whatever
+	@# context happens to be current would be wrong (and possibly destructive).
+	@kubectl config use-context kind-rbac-why-dev
 	@echo ""
 	@echo "Step 2/5: Building binary..."
 	@$(MAKE) build
@@ -141,7 +144,7 @@ e2e: ## Complete e2e workflow: create kind cluster, setup, test, and cleanup
 	@$(MAKE) kind-setup-rbac
 	@echo ""
 	@echo "Step 4/5: Running e2e tests..."
-	@RBAC_WHY_BINARY=./bin/$(BINARY_NAME) go test -v -timeout 30m ./test/e2e/...
+	@RBAC_WHY_BINARY=$(CURDIR)/bin/$(BINARY_NAME) go test -v -timeout 30m ./test/e2e/...
 	@echo ""
 	@echo "Step 5/5: E2E tests completed successfully!"
 	@echo ""

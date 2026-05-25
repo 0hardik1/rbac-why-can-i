@@ -32,7 +32,7 @@ go test -v -run TestCanI_ServiceAccountGetSecrets ./test/e2e/
 
 E2E tests look for the binary at `$RBAC_WHY_BINARY` or `../../bin/kubectl-rbac_why`. They `os.Exit(0)` (skip silently) if `kubectl cluster-info` fails, and apply `test/e2e/testdata/manifests/rbac-fixtures.yaml` against whatever the current context points at — point at a kind cluster before running. `make e2e` handles this end-to-end.
 
-Toolchain: Go 1.25.5 (per `go.mod`; README says 1.21+ but go.mod is the source of truth), `golangci-lint` v1.55.2, `kind` v0.20.0. Install dev tools with `make tools`.
+Toolchain: Go 1.25.5 (per `go.mod`; README says 1.21+ but go.mod is the source of truth), `golangci-lint` v2.12.2 (v2 config schema, `/v2` module path), `kind` v0.20.0. Install dev tools with `make tools`.
 
 ## Architecture
 
@@ -49,15 +49,15 @@ Layered, with a clear unidirectional dependency: `cmd → pkg/cmd/cani → {pkg/
 - **`pkg/rbac/`** — pure RBAC logic, no I/O beyond the `RBACClient` interface.
   - `types.go`: `PermissionRequest`, `Subject`, `PermissionGrant`, `PermissionResult`, `RiskyPermission`.
   - `matcher.go`: `RuleMatches`, `SubjectMatches`, `SubjectMatchesWithGroups`, `GetImplicitGroups`.
-  - `resolver.go`: `ParseSubject`, `Resolver.ResolvePermission` (single permission), `Resolver.ResolveAllPermissions` (all rules for a subject, used by `--show-risky`).
-- **`pkg/output/`** — output rendering. `NewPrinter(format)` returns a `Printer` for `text|json|yaml|dot|mermaid`. `risky.go` defines `RiskyPatterns` and `AnalyzeRiskyPermissions`/`PrintRiskyPermissions` consumed when `--show-risky` is set.
+  - `resolver.go`: `ParseSubject`, `Resolver.ResolvePermission` (single permission), `Resolver.ResolveAllPermissions` (all rules for a subject, used by `--show-risky`), `Resolver.ResolveSubjectsWithPermission` (reverse lookup, used by `--who-can`), `Resolver.ComparePermissions` (used by `--compare-with`).
+- **`pkg/output/`** — output rendering. `NewPrinter(format, color)` returns a `Printer` for `text|json|yaml|dot|mermaid`. `color.go` resolves `--color auto|always|never` to a bool (TTY + `NO_COLOR` aware) via `ResolveColor`. `risky.go` defines `RiskyPatterns` and `AnalyzeRiskyPermissions`/`PrintRiskyPermissions` consumed when `--show-risky` is set. `reverse.go` and `compare.go` render `--who-can` and `--compare-with`.
 
 ### Resolution algorithm (key invariants)
 
 1. `ParseSubject` splits on prefix: `system:serviceaccount:NS:NAME` → ServiceAccount; other `system:*` → Group; everything else → User.
 2. `GetImplicitGroups` always adds `system:authenticated`; ServiceAccounts also get `system:serviceaccounts` and `system:serviceaccounts:<ns>`. Explicit groups (e.g. cert `O` fields, aws-auth `groups`) are merged in. **Group binding matches must consult this list, not just `subject.Groups` directly.**
-3. `Resolver.ResolvePermission` always scans every `ClusterRoleBinding` (cluster-wide grants apply regardless of namespace), then — only if `request.Namespace != ""` — also scans `RoleBindings` in that namespace. A `RoleBinding` with `RoleRef.Kind == "ClusterRole"` references the ClusterRole's rules but produces a namespace-scoped grant (`ScopeNamespace`).
-4. `RuleMatches` checks verb, API group, resource (with subresource handling), and resourceName independently. `*` is the wildcard for all three of verbs/apiGroups/resources. Resource matching also handles `pods/*` patterns. If a rule has `ResourceNames` but the request omits a resource name, the rule is treated as matching (a "could match" check).
+3. `Resolver.ResolvePermission` always scans every `ClusterRoleBinding` (cluster-wide grants apply regardless of namespace), then — only if `request.Namespace != ""` *and* the request is not a non-resource URL — also scans `RoleBindings` in that namespace. A `RoleBinding` with `RoleRef.Kind == "ClusterRole"` references the ClusterRole's rules but produces a namespace-scoped grant (`ScopeNamespace`). Non-resource URLs (e.g. `/healthz`) are cluster-scoped only on a real cluster, so they're never granted via a `RoleBinding`; the RoleBinding scan is skipped for them (same invariant in `ResolveSubjectsWithPermission`).
+4. `RuleMatches` checks verb, API group, resource (with subresource handling), and resourceName independently. `*` is the wildcard for verbs/apiGroups/resources. Resource matching mirrors the upstream authorizer: `*` (all resources) and `*/<subresource>` (e.g. `*/scale`, across all resources) are honored, but `<resource>/*` (e.g. `pods/*`) is **not** a valid RBAC pattern and is not treated as a wildcard. When `request.NonResourceURL != ""`, only the verb and the URL are matched (against `rule.NonResourceURLs`, with `/path/*` prefix support). If a rule has `ResourceNames` but the request omits a resource name, the rule is treated as matching (a "could match" check).
 5. The result returns **every** matching grant chain — duplicates across paths are intentional. Don't dedupe.
 
 ### Subject resolution from current context

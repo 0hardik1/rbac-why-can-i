@@ -12,10 +12,19 @@ type PermissionRequest struct {
 	Subresource  string
 	ResourceName string
 	Namespace    string // Empty for cluster-scoped resources
+
+	// NonResourceURL is set instead of Resource/APIGroup for non-resource
+	// requests such as "/healthz" or "/metrics". These are grantable only
+	// via ClusterRoles (nonResourceURLs rules).
+	NonResourceURL string
 }
 
-// FullResource returns the resource with subresource if present (e.g., "pods/exec")
+// FullResource returns the resource with subresource if present (e.g.,
+// "pods/exec"), or the non-resource URL when the request targets one.
 func (p PermissionRequest) FullResource() string {
+	if p.NonResourceURL != "" {
+		return p.NonResourceURL
+	}
 	if p.Subresource != "" {
 		return p.Resource + "/" + p.Subresource
 	}
@@ -87,4 +96,35 @@ type RiskyPermission struct {
 	Description string
 	Severity    string // "critical", "high", "medium"
 	Grants      []PermissionGrant
+}
+
+// SubjectGrant is a subject that holds a permission, together with the binding
+// and role chains that grant it. Produced by reverse lookup (who-can).
+type SubjectGrant struct {
+	Subject Subject
+	Grants  []PermissionGrant
+}
+
+// ReverseResult holds every subject that can perform a permission request
+// (the inverse of PermissionResult).
+type ReverseResult struct {
+	Request  PermissionRequest
+	Subjects []SubjectGrant
+}
+
+// RuleGrant pairs a policy rule with the grant chains that provide it.
+type RuleGrant struct {
+	Rule   rbacv1.PolicyRule
+	Grants []PermissionGrant
+}
+
+// PermissionComparison is the result of comparing two subjects' effective
+// rules: the rules unique to each, and those they share.
+type PermissionComparison struct {
+	SubjectA   Subject
+	SubjectB   Subject
+	OnlyA      []RuleGrant // rules only SubjectA has
+	OnlyB      []RuleGrant // rules only SubjectB has
+	Shared     []RuleGrant // rules both have (grants shown from SubjectA)
+	SoftErrors []error     // non-fatal errors from either resolution
 }

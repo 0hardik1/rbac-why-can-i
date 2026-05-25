@@ -171,7 +171,10 @@ func matchesRiskyPattern(rule rbacv1.PolicyRule, pattern RiskyPattern) bool {
 	groupMatch := false
 	for _, pg := range pattern.APIGroups {
 		for _, rg := range rule.APIGroups {
-			if rg == pg || rg == "*" || pg == "*" {
+			// A rule matches the pattern's group when the group is equal or the
+			// rule grants all groups ("*"). A pattern entry of "*" only matches a
+			// rule that itself uses "*", so it does not match every rule.
+			if rg == pg || rg == "*" {
 				groupMatch = true
 				break
 			}
@@ -187,7 +190,10 @@ func matchesRiskyPattern(rule rbacv1.PolicyRule, pattern RiskyPattern) bool {
 	resourceMatch := false
 	for _, pr := range pattern.Resources {
 		for _, rr := range rule.Resources {
-			if rr == pr || rr == "*" || pr == "*" {
+			// As with groups: equal resource, or a rule that grants all
+			// resources ("*"). A pattern entry of "*" only matches a rule that
+			// itself uses "*".
+			if rr == pr || rr == "*" {
 				resourceMatch = true
 				break
 			}
@@ -200,8 +206,9 @@ func matchesRiskyPattern(rule rbacv1.PolicyRule, pattern RiskyPattern) bool {
 	return resourceMatch
 }
 
-// PrintRiskyPermissions outputs risky permissions analysis
-func PrintRiskyPermissions(w io.Writer, risks []rbac.RiskyPermission) {
+// PrintRiskyPermissions outputs risky permissions analysis. color enables ANSI
+// coloring of the severity headers.
+func PrintRiskyPermissions(w io.Writer, risks []rbac.RiskyPermission, color bool) {
 	if len(risks) == 0 {
 		_, _ = fmt.Fprintln(w, "No risky permissions detected.")
 		return
@@ -215,14 +222,14 @@ func PrintRiskyPermissions(w io.Writer, risks []rbac.RiskyPermission) {
 	medium := filterBySeverity(risks, "medium")
 
 	if len(critical) > 0 {
-		_, _ = fmt.Fprintln(w, "CRITICAL:")
+		_, _ = fmt.Fprintln(w, colorize(color, colorRed, "CRITICAL:"))
 		for _, risk := range critical {
 			printRisk(w, risk)
 		}
 	}
 
 	if len(high) > 0 {
-		_, _ = fmt.Fprintln(w, "HIGH:")
+		_, _ = fmt.Fprintln(w, colorize(color, colorYellow, "HIGH:"))
 		for _, risk := range high {
 			printRisk(w, risk)
 		}

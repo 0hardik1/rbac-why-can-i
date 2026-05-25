@@ -1,11 +1,27 @@
 package rbac
 
 import (
+	"strings"
+
 	rbacv1 "k8s.io/api/rbac/v1"
 )
 
-// RuleMatches checks if a PolicyRule grants the requested permission
+// RuleMatches reports whether a PolicyRule grants the requested permission.
+//
+// Verb, API group, resource, and non-resource-URL matching mirror the upstream
+// Kubernetes RBAC authorizer so that answers agree with what the live cluster
+// would decide. ResourceNames is treated as a "could match" check: a rule
+// scoped to specific names still matches a request that omits a resource name
+// (see the comment on that branch).
 func RuleMatches(rule rbacv1.PolicyRule, request PermissionRequest) bool {
+	// Non-resource URL request (e.g. /healthz, /metrics). Only the verb and
+	// the URL are relevant; API group and resource don't apply, and such
+	// access is grantable only via ClusterRoles.
+	if request.NonResourceURL != "" {
+		return matchesVerb(rule.Verbs, request.Verb) &&
+			matchesNonResourceURL(rule.NonResourceURLs, request.NonResourceURL)
+	}
+
 	// Check verb match
 	if !matchesVerb(rule.Verbs, request.Verb) {
 		return false
@@ -21,21 +37,20 @@ func RuleMatches(rule rbacv1.PolicyRule, request PermissionRequest) bool {
 		return false
 	}
 
-	// Check resource name match (if specified in rule)
+	// ResourceNames restricts a rule to specific named objects. Only reject
+	// when the request names a specific object that the rule's list excludes.
+	// When the request omits a name (a "can-i"-style check), a name-scoped
+	// rule is reported as a possible match rather than excluded.
 	if len(rule.ResourceNames) > 0 && request.ResourceName != "" {
 		if !matchesResourceName(rule.ResourceNames, request.ResourceName) {
 			return false
 		}
 	}
 
-	// If rule has resourceNames but request doesn't specify one,
-	// the rule still applies (it grants access to specific resources)
-	// For a "can-i" check without resource name, we assume it could match
-
 	return true
 }
 
-// matchesVerb checks if the requested verb matches any of the rule verbs
+// matchesVerb reports whether the requested verb is allowed by the rule.
 func matchesVerb(ruleVerbs []string, requestVerb string) bool {
 	for _, v := range ruleVerbs {
 		if v == rbacv1.VerbAll || v == requestVerb {
@@ -45,7 +60,8 @@ func matchesVerb(ruleVerbs []string, requestVerb string) bool {
 	return false
 }
 
-// matchesAPIGroup checks if the requested API group matches any of the rule groups
+// matchesAPIGroup reports whether the requested API group is allowed by the
+// rule. The core API group is the empty string "".
 func matchesAPIGroup(ruleGroups []string, requestGroup string) bool {
 	for _, g := range ruleGroups {
 		if g == rbacv1.APIGroupAll || g == requestGroup {
@@ -55,44 +71,68 @@ func matchesAPIGroup(ruleGroups []string, requestGroup string) bool {
 	return false
 }
 
-// matchesResource checks if the requested resource (with subresource) matches any of the rule resources
+// matchesResource reports whether the requested resource (optionally with a
+// subresource) is allowed by the rule. This mirrors the upstream authorizer's
+// resourceMatches: it honors "*" (all resources) and "*/<subresource>" (a
+// subresource across all resources, e.g. "*/scale"), and otherwise requires an
+// exact match on "<resource>" or "<resource>/<subresource>".
+//
+// Note: "<resource>/*" (e.g. "pods/*") is NOT a valid RBAC pattern upstream and
+// is intentionally not matched, so that a rule granting "pods/*" does not appear
+// to grant "pods/exec" when the live cluster would deny it.
 func matchesResource(ruleResources []string, requestResource, requestSubresource string) bool {
-	// Build the full resource string (e.g., "pods" or "pods/exec")
-	fullResource := requestResource
+	// Build the full resource string (e.g., "pods" or "pods/exec").
+	combined := requestResource
 	if requestSubresource != "" {
-		fullResource = requestResource + "/" + requestSubresource
+		combined = requestResource + "/" + requestSubresource
 	}
 
 	for _, r := range ruleResources {
-		// Wildcard matches everything
+		// "*" matches every resource.
 		if r == rbacv1.ResourceAll {
 			return true
 		}
-
-		// Exact match
-		if r == fullResource {
+		// Exact match on "<resource>" or "<resource>/<subresource>".
+		if r == combined {
 			return true
 		}
-
-		// Handle wildcard subresource: "pods/*" matches "pods/log", "pods/exec", etc.
-		if requestSubresource != "" {
-			if r == requestResource+"/*" {
-				return true
-			}
+		// "*/<subresource>" matches the requested subresource on any resource.
+		if requestSubresource == "" {
+			continue
 		}
-
-		// If request has no subresource but rule is for base resource
-		if requestSubresource == "" && r == requestResource {
+		if len(r) == len(requestSubresource)+2 &&
+			strings.HasPrefix(r, "*/") &&
+			strings.HasSuffix(r, requestSubresource) {
 			return true
 		}
 	}
 	return false
 }
 
-// matchesResourceName checks if the requested resource name matches any of the rule names
+// matchesResourceName reports whether the requested resource name is in the
+// rule's ResourceNames list.
 func matchesResourceName(ruleNames []string, requestName string) bool {
 	for _, n := range ruleNames {
 		if n == requestName {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesNonResourceURL reports whether the requested non-resource URL is
+// allowed by the rule. Mirrors the upstream authorizer's nonResourceURLMatches:
+// "*" matches any URL, and a trailing-star rule like "/api/*" matches any path
+// with that prefix.
+func matchesNonResourceURL(ruleURLs []string, requestURL string) bool {
+	for _, u := range ruleURLs {
+		if u == rbacv1.NonResourceAll {
+			return true
+		}
+		if u == requestURL {
+			return true
+		}
+		if strings.HasSuffix(u, "*") && strings.HasPrefix(requestURL, strings.TrimRight(u, "*")) {
 			return true
 		}
 	}

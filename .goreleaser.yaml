@@ -1,0 +1,68 @@
+# goreleaser v2 configuration. See https://goreleaser.com
+# Local snapshot:  goreleaser release --snapshot --clean
+# Real release:    git tag vX.Y.Z && git push --tags  (handled by CI)
+version: 2
+
+project_name: kubectl-rbac-why
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: kubectl-rbac_why
+    main: ./cmd/kubectl-rbac_why
+    binary: kubectl-rbac_why
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.buildDate={{ .Date }}
+
+archives:
+  - id: default
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE*
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+
+release:
+  prerelease: auto
+
+# krew plugin manifest. By default the manifest is generated as a release
+# artifact but not pushed (skip_upload). To publish to a krew index, set the
+# repository owner below, provide KREW_INDEX_TOKEN in CI, and flip skip_upload
+# to "false".
+krews:
+  - name: rbac-why
+    repository:
+      owner: hardik
+      name: krew-index
+      token: "{{ .Env.KREW_INDEX_TOKEN }}"
+    homepage: "https://github.com/hardik/kubectl-rbac-why"
+    short_description: "Trace why an RBAC permission is granted"
+    description: |
+      Explains WHY a Kubernetes RBAC permission is granted by walking the full
+      Subject -> Binding -> Role -> Rule chain, including reverse lookup
+      ("who can do X"), subject comparison, and risky-permission analysis.
+    skip_upload: "true"

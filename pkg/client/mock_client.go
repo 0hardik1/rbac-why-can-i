@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 )
@@ -56,6 +57,20 @@ func (m *MockRBACClient) ListClusterRoles(ctx context.Context) (*rbacv1.ClusterR
 func (m *MockRBACClient) ListRoleBindings(ctx context.Context, namespace string) (*rbacv1.RoleBindingList, error) {
 	if m.ListRoleBindingsError != nil {
 		return nil, m.ListRoleBindingsError
+	}
+	if namespace == "" {
+		// Mirror client-go: an empty namespace lists across all namespaces.
+		// Iterate in sorted namespace order for deterministic output.
+		namespaces := make([]string, 0, len(m.RoleBindings))
+		for ns := range m.RoleBindings {
+			namespaces = append(namespaces, ns)
+		}
+		sort.Strings(namespaces)
+		all := &rbacv1.RoleBindingList{}
+		for _, ns := range namespaces {
+			all.Items = append(all.Items, m.RoleBindings[ns].Items...)
+		}
+		return all, nil
 	}
 	if bindings, ok := m.RoleBindings[namespace]; ok {
 		return bindings, nil
