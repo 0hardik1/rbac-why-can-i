@@ -48,17 +48,22 @@ type RbacWhyOptions struct {
 	CurrentContext *ContextInfo
 
 	// Permission request
-	Verb        string
-	Resource    string
-	Subresource string
-	APIGroup    string
+	Verb           string
+	Resource       string
+	Subresource    string
+	APIGroup       string
+	NonResourceURL string // set instead of Resource for non-resource URLs (e.g. /healthz)
 
 	// Namespace
 	Namespace string
 
 	// Output options
-	Output    string // text, json, yaml, dot, mermaid
-	ShowRisky bool
+	Output        string // text, json, yaml, dot, mermaid
+	Color         string // auto, always, never
+	ShowRisky     bool
+	WhoCan        bool   // reverse lookup: list subjects that can perform VERB RESOURCE
+	AllNamespaces bool   // with --show-risky, scan RoleBindings across all namespaces
+	CompareWith   string // compare the subject's effective permissions with another subject
 
 	// AWS options
 	AWSProfile  string // AWS profile to use for authentication
@@ -79,13 +84,15 @@ func NewRbacWhyOptions(streams genericclioptions.IOStreams) *RbacWhyOptions {
 		ConfigFlags: genericclioptions.NewConfigFlags(true),
 		IOStreams:   streams,
 		Output:      "text",
+		Color:       "auto",
 	}
 }
 
 // Complete fills in fields that were not specified
 func (o *RbacWhyOptions) Complete(args []string) error {
-	// For --show-risky, we don't need VERB RESOURCE
-	if !o.ShowRisky {
+	// VERB RESOURCE is needed for the normal check and --who-can, but not for
+	// whole-subject modes (--show-risky, --compare-with).
+	if !o.ShowRisky && o.CompareWith == "" {
 		if len(args) < 2 {
 			return fmt.Errorf("requires at least 2 arguments: VERB RESOURCE")
 		}
@@ -108,6 +115,11 @@ func (o *RbacWhyOptions) Complete(args []string) error {
 	// Get namespace from ConfigFlags
 	if o.ConfigFlags.Namespace != nil && *o.ConfigFlags.Namespace != "" {
 		o.Namespace = *o.ConfigFlags.Namespace
+	}
+
+	// who-can is a reverse lookup and resolves no subject identity.
+	if o.WhoCan {
+		return nil
 	}
 
 	// If --as is not provided, get subject from current context
@@ -377,8 +389,16 @@ func extractProfileFromArgs(args []string) string {
 	return ""
 }
 
-// parseResource parses a resource string like "pods", "pods/log", "deployments.apps"
+// parseResource parses a resource string like "pods", "pods/log", "deployments.apps".
+// A leading "/" marks a non-resource URL (e.g. "/healthz", "/metrics", "/api/*"),
+// which has no API group or subresource.
 func (o *RbacWhyOptions) parseResource(resource string) error {
+	// Non-resource URL (e.g. "/healthz")
+	if strings.HasPrefix(resource, "/") {
+		o.NonResourceURL = resource
+		return nil
+	}
+
 	// Handle subresource (e.g., "pods/exec")
 	if idx := strings.Index(resource, "/"); idx != -1 {
 		o.Resource = resource[:idx]
@@ -389,12 +409,12 @@ func (o *RbacWhyOptions) parseResource(resource string) error {
 	}
 
 	// Handle API group (e.g., "deployments.apps" or "deployments.apps/v1")
-	if idx := strings.Index(resource, "."); idx != -1 {
-		o.Resource = resource[:idx]
-		o.APIGroup = resource[idx+1:]
+	if res, group, ok := strings.Cut(resource, "."); ok {
+		o.Resource = res
+		o.APIGroup = group
 		// Remove version if present (e.g., "apps/v1" -> "apps")
-		if vIdx := strings.Index(o.APIGroup, "/"); vIdx != -1 {
-			o.APIGroup = o.APIGroup[:vIdx]
+		if g, _, ok := strings.Cut(o.APIGroup, "/"); ok {
+			o.APIGroup = g
 		}
 	}
 
@@ -403,19 +423,50 @@ func (o *RbacWhyOptions) parseResource(resource string) error {
 
 // Validate checks that the options are valid
 func (o *RbacWhyOptions) Validate() error {
-	// At this point, o.As should be set either from --as flag or from current context
-	if o.As == "" {
+	// At most one special mode at a time.
+	modes := 0
+	if o.ShowRisky {
+		modes++
+	}
+	if o.WhoCan {
+		modes++
+	}
+	if o.CompareWith != "" {
+		modes++
+	}
+	if modes > 1 {
+		return fmt.Errorf("--show-risky, --who-can, and --compare-with are mutually exclusive")
+	}
+
+	switch o.Color {
+	case "", "auto", "always", "never":
+	default:
+		return fmt.Errorf("invalid --color value %q (valid: auto, always, never)", o.Color)
+	}
+
+	// Every mode except who-can resolves and needs a subject.
+	if !o.WhoCan && o.As == "" {
 		return fmt.Errorf("could not determine subject: either use --as flag or ensure kubeconfig has a valid current context")
 	}
 
-	// For --show-risky, we don't need verb/resource
-	if !o.ShowRisky {
+	// VERB RESOURCE is required for the normal check and for --who-can, but not
+	// for whole-subject modes (--show-risky, --compare-with).
+	if !o.ShowRisky && o.CompareWith == "" {
 		if o.Verb == "" {
 			return fmt.Errorf("verb is required")
 		}
+		if o.Resource == "" && o.NonResourceURL == "" {
+			return fmt.Errorf("resource is required (a resource like \"pods\" or a non-resource URL like \"/healthz\")")
+		}
+	}
 
-		if o.Resource == "" {
-			return fmt.Errorf("resource is required")
+	// who-can and compare-with render their own output, supporting a subset of formats.
+	if o.WhoCan || o.CompareWith != "" {
+		switch o.Output {
+		case "text", "json", "yaml":
+			return nil
+		default:
+			return fmt.Errorf("this mode supports output formats text, json, yaml (got %q)", o.Output)
 		}
 	}
 
@@ -432,10 +483,11 @@ func (o *RbacWhyOptions) Validate() error {
 // ToPermissionRequest converts options to a PermissionRequest
 func (o *RbacWhyOptions) ToPermissionRequest() rbac.PermissionRequest {
 	return rbac.PermissionRequest{
-		Verb:        o.Verb,
-		APIGroup:    o.APIGroup,
-		Resource:    o.Resource,
-		Subresource: o.Subresource,
-		Namespace:   o.Namespace,
+		Verb:           o.Verb,
+		APIGroup:       o.APIGroup,
+		Resource:       o.Resource,
+		Subresource:    o.Subresource,
+		Namespace:      o.Namespace,
+		NonResourceURL: o.NonResourceURL,
 	}
 }

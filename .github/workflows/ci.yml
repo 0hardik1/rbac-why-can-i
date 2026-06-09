@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-lint:
+    name: Build, test, lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Check gofmt
+        run: |
+          unformatted=$(gofmt -l cmd/ pkg/ test/)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test (race + coverage)
+        run: go test -race -coverprofile=coverage.out ./pkg/...
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Install golangci-lint
+        run: curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+
+      - name: Lint
+        run: golangci-lint run ./...
+
+  e2e:
+    name: E2E (kind)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: rbac-why-dev
+          wait: 60s
+
+      - name: Build plugin
+        run: make build
+
+      - name: Apply RBAC fixtures
+        run: kubectl apply -f test/e2e/testdata/manifests/
+
+      - name: Run e2e tests
+        # Absolute path: `go test` runs with its working directory set to the
+        # package dir (test/e2e), so a relative ./bin path would not resolve.
+        run: RBAC_WHY_BINARY="$GITHUB_WORKSPACE/bin/kubectl-rbac_why" go test -v -timeout 30m ./test/e2e/...
