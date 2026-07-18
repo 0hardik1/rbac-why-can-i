@@ -193,10 +193,11 @@ func ruleCoversAny(ruleVals, patternVals []string, resourceSemantics bool) bool 
 // PrintRiskyPermissions outputs risky permissions analysis. resolveErrs are
 // failures that occurred while gathering the subject's permissions; when
 // non-empty the analysis is incomplete and is reported as such rather than as
-// a clean bill of health.
-func PrintRiskyPermissions(w io.Writer, risks []rbac.RiskyPermission, resolveErrs []error) {
+// a clean bill of health. color enables ANSI coloring of the severity headers.
+func PrintRiskyPermissions(w io.Writer, risks []rbac.RiskyPermission, resolveErrs []error, color bool) {
 	if len(resolveErrs) > 0 {
-		_, _ = fmt.Fprintf(w, "WARNING: analysis is INCOMPLETE, %d RBAC object(s) could not be read:\n", len(resolveErrs))
+		_, _ = fmt.Fprintf(w, "%s: analysis is INCOMPLETE, %d RBAC object(s) could not be read:\n",
+			colorize(color, colorYellow, "WARNING"), len(resolveErrs))
 		for _, e := range resolveErrs {
 			_, _ = fmt.Fprintf(w, "  - %v\n", e)
 		}
@@ -220,14 +221,14 @@ func PrintRiskyPermissions(w io.Writer, risks []rbac.RiskyPermission, resolveErr
 	medium := filterBySeverity(risks, "medium")
 
 	if len(critical) > 0 {
-		_, _ = fmt.Fprintln(w, "CRITICAL:")
+		_, _ = fmt.Fprintln(w, colorize(color, colorRed, "CRITICAL:"))
 		for _, risk := range critical {
 			printRisk(w, risk)
 		}
 	}
 
 	if len(high) > 0 {
-		_, _ = fmt.Fprintln(w, "HIGH:")
+		_, _ = fmt.Fprintln(w, colorize(color, colorYellow, "HIGH:"))
 		for _, risk := range high {
 			printRisk(w, risk)
 		}

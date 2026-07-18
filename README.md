@@ -147,6 +147,36 @@ make install    # copy to $GOBIN
 
 `$GOBIN` (or `$GOPATH/bin`) must be on your `PATH` for kubectl to discover the plugin.
 
+### Install via Krew
+
+Once published to a [krew](https://krew.sigs.k8s.io) index, the plugin installs with:
+
+```bash
+kubectl krew install rbac-why
+```
+
+Tagged releases are built with [GoReleaser](https://goreleaser.com) (see `.goreleaser.yaml`), which also generates the krew plugin manifest. Until the plugin is in the central krew-index, install a tagged release from the GitHub Releases page, or build from source as above.
+
+### Shell Completion
+
+The plugin generates completion scripts via Cobra:
+
+```bash
+# Standalone binary (bash shown; see `kubectl-rbac_why completion --help` for zsh/fish/powershell)
+source <(kubectl-rbac_why completion bash)
+```
+
+To get completion when invoking through kubectl (`kubectl rbac-why <TAB>`), put a small wrapper named `kubectl_complete-rbac_why` on your `PATH`:
+
+```bash
+cat <<'EOF' > kubectl_complete-rbac_why
+#!/usr/bin/env sh
+kubectl-rbac_why __complete "$@"
+EOF
+chmod +x kubectl_complete-rbac_why
+# then move it somewhere on your PATH, e.g. /usr/local/bin/
+```
+
 ## Usage
 
 ### Basic Syntax
@@ -259,6 +289,48 @@ This detects risky permissions such as:
 - Wildcard permissions (cluster-admin equivalent)
 
 On EKS, permissions granted through EKS access policies attached to the caller's Access Entry are included in the analysis. If some RBAC objects cannot be read, the report is labeled incomplete instead of claiming a clean result.
+
+### Reverse Lookup: Who Can Do X?
+
+List every subject that can perform an action (the inverse of the normal query):
+
+```bash
+# Who can delete secrets in the default namespace?
+kubectl rbac-why --who-can delete secrets -n default
+
+# Cluster-scoped: who can delete nodes?
+kubectl rbac-why --who-can delete nodes
+```
+
+`--who-can` ignores `--as` and supports `text`, `json`, and `yaml` output. ClusterRoleBindings are always scanned; RoleBindings are scanned in the namespace given by `-n`.
+
+### Compare Two Subjects
+
+Diff the effective permissions of two subjects (useful for privilege review):
+
+```bash
+kubectl rbac-why --as system:serviceaccount:default:app-a \
+  --compare-with system:serviceaccount:default:app-b -n default
+```
+
+The output lists the rules only A has, the rules only B has, and the count of shared rules. Supports `text`, `json`, and `yaml`.
+
+### Non-Resource URLs
+
+Check access to non-resource endpoints by passing a path starting with `/`:
+
+```bash
+kubectl rbac-why can-i get /healthz
+kubectl rbac-why can-i --as system:serviceaccount:monitoring:prometheus get /metrics
+```
+
+### Scan All Namespaces
+
+With `--show-risky`, use `-A` / `--all-namespaces` to scan RoleBindings across every namespace instead of just one:
+
+```bash
+kubectl rbac-why --as system:serviceaccount:default:my-sa --show-risky -A
+```
 
 ## Development
 
@@ -403,18 +475,20 @@ For each Role/ClusterRole found through matching bindings, the tool examines eve
 rule matches if ALL of the following are true:
 ├── Verb matches (rule.verbs contains request.verb OR "*")
 ├── API Group matches (rule.apiGroups contains request.apiGroup OR "*")
-├── Resource matches (rule.resources contains request.resource, "*", or "*/subresource")
+├── Resource matches (rule.resources contains request.resource, "*", or "*/<subresource>")
 │   └── Subresources: "pods/exec" matches "pods/exec", "*/exec", or "*"
 └── ResourceNames: a rule with resourceNames only matches when the request
     names one of those objects; a request without a name is not satisfied
 ```
 
-**Wildcard handling** (mirrors the upstream Kubernetes RBAC evaluator):
+**Wildcard handling** (mirrors the upstream Kubernetes authorizer, so answers agree with the live cluster):
 - `*` in verbs matches any verb
 - `*` in apiGroups matches any API group
 - `*` in resources matches any resource and subresource
-- `*/scale` matches the `scale` subresource on any resource
-- `pods/*` is NOT a wildcard in Kubernetes and is not treated as one
+- `*/<subresource>` matches that subresource on any resource (e.g. `*/scale` matches `deployments/scale`)
+- `<resource>/*` (e.g. `pods/*`) is **not** a valid RBAC pattern and is not treated as a wildcard, matching how the cluster actually evaluates rules
+
+For non-resource URLs (e.g. `/healthz`, `/metrics`), only the verb and the URL are matched; a rule's `nonResourceURLs` may use a trailing `*` (e.g. `/api/*`).
 
 ### Step 6: Build Grant Chains
 
@@ -486,6 +560,20 @@ All matching chains are returned, showing **every path** by which the permission
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+## Known Limitations
+
+- **Group membership must be explicit.** The tool knows a subject's groups only from what it can derive: implicit ServiceAccount groups, client-certificate `O` fields, or the EKS `aws-auth` / Access Entry mapping. Groups assigned by an external identity provider (OIDC, LDAP) at token-review time are not visible, so grants via those groups won't appear unless you pass the identity (and its groups) via `--as`.
+- **Token and auth-provider identities can't be resolved locally.** When the kubeconfig uses a bearer token or an auth provider (oidc, gcp), the tool falls back to the kubeconfig user name; use `--as` to specify the real subject.
+- **EKS-managed access policies are shown but not expanded.** Permissions granted by EKS access policies (e.g. `AmazonEKSClusterAdminPolicy`) are surfaced as context, not traced rule-by-rule, because EKS enforces them outside the standard RBAC chain.
+- **Aggregated ClusterRoles are matched but attributed to the aggregate.** The aggregation controller materializes aggregated rules onto the aggregate ClusterRole, so they are detected; the tool reports them as belonging to the aggregate role rather than the source role.
+
+## Troubleshooting
+
+- **`kubectl rbac-why` not found**: ensure the binary `kubectl-rbac_why` (with an underscore) is on your `PATH`. Run `make kubectl-setup` and confirm with `kubectl plugin list`.
+- **`permission denied` or empty results**: the tool reads Roles, ClusterRoles, RoleBindings, and ClusterRoleBindings with *your own* credentials (it does not impersonate the subject being investigated), so you need read access to those RBAC objects.
+- **EKS: wrong or missing identity**: export `AWS_PROFILE` (or pass `--profile`) so both `aws eks get-token` and the plugin's EKS API calls use the right credentials. Use `--skip-eks-lookup` to disable EKS API calls entirely.
+- **Answer disagrees with `kubectl auth can-i`**: confirm the subject and its groups are correct (see Known Limitations). For external-IdP groups, pass them explicitly via `--as`.
 
 ## License
 

@@ -30,6 +30,11 @@ type resourceInfo struct {
 // Discovery failures and unknown resources degrade to a warning on errOut and
 // the request is evaluated as-is.
 func (o *RbacWhyOptions) applyDiscovery(restConfig *rest.Config, request *rbac.PermissionRequest) {
+	// Non-resource URLs (e.g. /healthz) are not part of API discovery.
+	if request.NonResourceURL != "" {
+		return
+	}
+
 	dc, err := discovery.NewDiscoveryClientForConfig(restConfig)
 	if err != nil {
 		_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to build discovery client (%v); evaluating request as-is\n", err)

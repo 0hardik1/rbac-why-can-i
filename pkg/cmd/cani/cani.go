@@ -62,7 +62,13 @@ context to determine the subject.`
   kubectl rbac-why can-i --as system:serviceaccount:default:my-sa --show-risky -n default
 
   # Show risky permissions for current user
-  kubectl rbac-why can-i --show-risky -n default`
+  kubectl rbac-why can-i --show-risky -n default
+
+  # Reverse lookup: list every subject that can delete secrets in a namespace
+  kubectl rbac-why --who-can delete secrets -n default
+
+  # Compare two subjects' effective permissions
+  kubectl rbac-why --as system:serviceaccount:default:a --compare-with system:serviceaccount:default:b -n default`
 )
 
 // NewCmdRbacWhy creates the rbac-why root command
@@ -96,12 +102,16 @@ func NewCmdRbacWhy(streams genericclioptions.IOStreams) *cobra.Command {
 
 	// Add our custom flags
 	cmd.Flags().StringVarP(&o.Output, "output", "o", "text", "Output format: text, json, yaml, dot, mermaid")
+	cmd.Flags().StringVar(&o.Color, "color", "auto", "Colorize text output: auto, always, never")
 	cmd.Flags().StringVar(&o.Subresource, "subresource", "", "Subresource to check (e.g. status, log, exec); alternative to RESOURCE/SUBRESOURCE syntax")
 	cmd.Flags().BoolVar(&o.ShowRisky, "show-risky", false, "Analyze and show risky permissions for the subject")
 	cmd.Flags().StringVarP(&o.AWSProfile, "profile", "p", "", "AWS profile to use for authentication (for EKS clusters)")
 	cmd.Flags().StringVar(&o.ClusterName, "cluster-name", "", "EKS cluster name (overrides auto-detection from kubeconfig)")
 	cmd.Flags().StringVar(&o.AWSRegion, "region", "", "AWS region for EKS API calls (overrides auto-detection)")
 	cmd.Flags().BoolVar(&o.SkipEKS, "skip-eks-lookup", false, "Skip EKS Access Entries and Pod Identity lookups")
+	cmd.Flags().BoolVar(&o.WhoCan, "who-can", false, "Reverse lookup: list all subjects that can perform VERB RESOURCE (ignores --as)")
+	cmd.Flags().BoolVarP(&o.AllNamespaces, "all-namespaces", "A", false, "With --show-risky, scan RoleBindings across all namespaces")
+	cmd.Flags().StringVar(&o.CompareWith, "compare-with", "", "Compare the subject's effective permissions with another subject (e.g. system:serviceaccount:ns:name)")
 
 	return cmd
 }
@@ -126,6 +136,16 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 	// local STS/EKS identity lookups use.
 	if o.AWSProfile != "" {
 		injectAWSProfile(restConfig, o.AWSProfile)
+	}
+
+	// Reverse lookup ("who can do X") resolves no subject identity and needs
+	// no EKS handling; answer it directly with the RBAC client.
+	if o.WhoCan {
+		rbacClient, err := client.NewK8sRBACClient(restConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create RBAC client: %w", err)
+		}
+		return o.runWhoCan(ctx, restConfig, rbac.NewResolver(rbacClient))
 	}
 
 	// Build an EKS client once and reuse it for both identity resolution
@@ -162,8 +182,8 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 	}
 
 	// Pod Identity enrichment: when the resolved subject is a
-	// ServiceAccount, surface any IAM role(s) bound to it. Informational —
-	// doesn't affect RBAC resolution.
+	// ServiceAccount, surface any IAM role(s) bound to it. Informational
+	// only; doesn't affect RBAC resolution.
 	if eksClient != nil && o.CurrentContext != nil && subject.Kind == "ServiceAccount" && o.CurrentContext.EKSClusterName != "" {
 		assocs, err := FindPodIdentityForServiceAccount(ctx, eksClient, o.CurrentContext.EKSClusterName, subject.Namespace, subject.Name)
 		if err != nil {
@@ -196,6 +216,11 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 		return o.runRiskyAnalysis(ctx, rbacClient, resolver, subject)
 	}
 
+	// Handle --compare-with flag
+	if o.CompareWith != "" {
+		return o.runCompare(ctx, resolver, subject)
+	}
+
 	// Normal permission check. Align the request with the cluster's API
 	// surface first (resolve the API group, drop the namespace for
 	// cluster-scoped resources).
@@ -218,7 +243,7 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 	}
 
 	// Print result
-	printer, err := output.NewPrinter(o.Output)
+	printer, err := output.NewPrinter(o.Output, output.ResolveColor(o.Color, o.Out))
 	if err != nil {
 		return err
 	}
@@ -382,7 +407,7 @@ func (o *RbacWhyOptions) orchestrateAWSIdentity(ctx context.Context, restConfig 
 
 // runRiskyAnalysis shows risky permissions for a subject
 func (o *RbacWhyOptions) runRiskyAnalysis(ctx context.Context, rbacClient client.RBACClient, resolver *rbac.Resolver, subject rbac.Subject) error {
-	grants, resolveErrs, err := resolver.ResolveAllPermissions(ctx, subject, o.Namespace)
+	grants, resolveErrs, err := resolver.ResolveAllPermissions(ctx, subject, o.Namespace, o.AllNamespaces)
 	if err != nil {
 		return fmt.Errorf("failed to resolve permissions: %w", err)
 	}
@@ -396,8 +421,35 @@ func (o *RbacWhyOptions) runRiskyAnalysis(ctx context.Context, rbacClient client
 	}
 
 	risks := output.AnalyzeRiskyPermissions(grants)
-	output.PrintRiskyPermissions(o.Out, risks, resolveErrs)
+	output.PrintRiskyPermissions(o.Out, risks, resolveErrs, output.ResolveColor(o.Color, o.Out))
 	return nil
+}
+
+// runWhoCan performs a reverse lookup: which subjects can perform the request.
+func (o *RbacWhyOptions) runWhoCan(ctx context.Context, restConfig *rest.Config, resolver *rbac.Resolver) error {
+	request := o.ToPermissionRequest()
+	o.applyDiscovery(restConfig, &request)
+	result, err := resolver.ResolveSubjectsWithPermission(ctx, request)
+	if err != nil {
+		return fmt.Errorf("failed to resolve subjects: %w", err)
+	}
+	return output.PrintSubjectsWithPermission(o.Out, result, o.Output)
+}
+
+// runCompare compares the subject's effective permissions with another subject.
+func (o *RbacWhyOptions) runCompare(ctx context.Context, resolver *rbac.Resolver, subject rbac.Subject) error {
+	other, err := rbac.ParseSubject(o.CompareWith)
+	if err != nil {
+		return fmt.Errorf("failed to parse --compare-with subject: %w", err)
+	}
+	comp, err := resolver.ComparePermissions(ctx, subject, other, o.Namespace, o.AllNamespaces)
+	if err != nil {
+		return fmt.Errorf("failed to compare permissions: %w", err)
+	}
+	for _, sErr := range comp.SoftErrors {
+		_, _ = fmt.Fprintf(o.ErrOut, "Warning: %v (comparison may be incomplete)\n", sErr)
+	}
+	return output.PrintComparison(o.Out, comp, o.Output)
 }
 
 // injectAWSProfile rewrites the REST config's AWS exec credential plugin so

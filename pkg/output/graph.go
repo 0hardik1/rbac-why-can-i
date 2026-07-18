@@ -32,13 +32,13 @@ func (p *DotPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Cont
 		if result.Incomplete() {
 			_, _ = fmt.Fprintf(w, "  incomplete [label=\"INCOMPLETE\\nno readable rule grants %s %s to %s\\n(some RBAC objects could not be read)\" shape=octagon style=filled fillcolor=orange];\n",
 				result.Request.Verb,
-				result.Request.Resource,
+				result.Request.FullResource(),
 				escapeLabel(result.Subject.String()))
 		} else {
 			_, _ = fmt.Fprintf(w, "  denied [label=\"DENIED\\n%s cannot %s %s\" shape=octagon style=filled fillcolor=red fontcolor=white];\n",
 				escapeLabel(result.Subject.String()),
 				result.Request.Verb,
-				result.Request.Resource)
+				result.Request.FullResource())
 		}
 		_, _ = fmt.Fprintln(w, "}")
 		return nil
@@ -103,7 +103,7 @@ func (p *MermaidPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *
 		if result.Incomplete() {
 			_, _ = fmt.Fprintf(w, "  incomplete{{INCOMPLETE: no readable rule grants %s %s to %s}}\n",
 				result.Request.Verb,
-				result.Request.Resource,
+				result.Request.FullResource(),
 				escapeMermaid(result.Subject.String()))
 			_, _ = fmt.Fprintln(w, "  style incomplete fill:#fa3,stroke:#333")
 			return nil
@@ -111,7 +111,7 @@ func (p *MermaidPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *
 		_, _ = fmt.Fprintf(w, "  denied{{DENIED: %s cannot %s %s}}\n",
 			escapeMermaid(result.Subject.String()),
 			result.Request.Verb,
-			result.Request.Resource)
+			result.Request.FullResource())
 		_, _ = fmt.Fprintln(w, "  style denied fill:#f66,stroke:#333,color:#fff")
 		return nil
 	}

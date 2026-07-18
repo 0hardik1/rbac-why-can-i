@@ -28,11 +28,13 @@ var eksPolicyClusterRoles = map[string]string{
 // eksPolicySyntheticRules covers policies whose rules are fixed and don't
 // correspond to a ClusterRole present on every cluster.
 var eksPolicySyntheticRules = map[string][]rbacv1.PolicyRule{
-	// Cluster-admin equivalent.
+	// Cluster-admin equivalent (covers non-resource URLs too, like the
+	// cluster-admin ClusterRole).
 	"AmazonEKSClusterAdminPolicy": {{
-		Verbs:     []string{rbacv1.VerbAll},
-		APIGroups: []string{rbacv1.APIGroupAll},
-		Resources: []string{rbacv1.ResourceAll},
+		Verbs:           []string{rbacv1.VerbAll},
+		APIGroups:       []string{rbacv1.APIGroupAll},
+		Resources:       []string{rbacv1.ResourceAll},
+		NonResourceURLs: []string{rbacv1.NonResourceAll},
 	}},
 	// Read-only access to all resources, including Secrets.
 	"AmazonEKSAdminViewPolicy": {{

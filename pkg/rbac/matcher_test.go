@@ -64,17 +64,9 @@ func TestRuleMatches(t *testing.T) {
 			expected: true,
 		},
 		{
-			name: "subresource wildcard star-slash form",
-			rule: rbacv1.PolicyRule{
-				Verbs:     []string{"get"},
-				APIGroups: []string{""},
-				Resources: []string{"*/log"},
-			},
-			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "pods", Subresource: "log"},
-			expected: true,
-		},
-		{
-			name: "pods/* is not a wildcard in Kubernetes",
+			// "<resource>/*" is not a valid upstream RBAC pattern; it must not
+			// appear to grant a subresource the live cluster would deny.
+			name: "resource/* does not grant a subresource (pods/* !-> pods/log)",
 			rule: rbacv1.PolicyRule{
 				Verbs:     []string{"get"},
 				APIGroups: []string{""},
@@ -84,13 +76,34 @@ func TestRuleMatches(t *testing.T) {
 			expected: false,
 		},
 		{
-			name: "star-slash form does not match base resource",
+			// "*/<subresource>" matches the subresource across all resources.
+			name: "*/scale matches deployments/scale",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"update"},
+				APIGroups: []string{"apps"},
+				Resources: []string{"*/scale"},
+			},
+			request:  PermissionRequest{Verb: "update", APIGroup: "apps", Resource: "deployments", Subresource: "scale"},
+			expected: true,
+		},
+		{
+			name: "*/scale does not match a base-resource request",
 			rule: rbacv1.PolicyRule{
 				Verbs:     []string{"get"},
 				APIGroups: []string{""},
 				Resources: []string{"*/scale"},
 			},
-			request:  PermissionRequest{Verb: "get", APIGroup: "apps", Resource: "deployments"},
+			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "pods"},
+			expected: false,
+		},
+		{
+			name: "base-resource rule does not grant a subresource request",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"create"},
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+			},
+			request:  PermissionRequest{Verb: "create", APIGroup: "", Resource: "pods", Subresource: "exec"},
 			expected: false,
 		},
 		{
@@ -114,27 +127,6 @@ func TestRuleMatches(t *testing.T) {
 			},
 			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "secrets", ResourceName: "other-secret"},
 			expected: false,
-		},
-		{
-			name: "resourceNames rule does not match request without a name",
-			rule: rbacv1.PolicyRule{
-				Verbs:         []string{"get"},
-				APIGroups:     []string{""},
-				Resources:     []string{"secrets"},
-				ResourceNames: []string{"my-secret"},
-			},
-			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "secrets"},
-			expected: false,
-		},
-		{
-			name: "rule without resourceNames matches any name",
-			rule: rbacv1.PolicyRule{
-				Verbs:     []string{"get"},
-				APIGroups: []string{""},
-				Resources: []string{"secrets"},
-			},
-			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "secrets", ResourceName: "my-secret"},
-			expected: true,
 		},
 		{
 			name: "no match - different verb",
@@ -195,6 +187,86 @@ func TestRuleMatches(t *testing.T) {
 			},
 			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "pods"},
 			expected: true,
+		},
+		{
+			// Kubernetes requires the requested name to match when
+			// resourceNames is non-empty: a nameless request asks for generic
+			// access, which a name-scoped rule does not grant.
+			name: "name-scoped rule does not match when request omits a name",
+			rule: rbacv1.PolicyRule{
+				Verbs:         []string{"get"},
+				APIGroups:     []string{""},
+				Resources:     []string{"secrets"},
+				ResourceNames: []string{"my-secret"},
+			},
+			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "secrets"},
+			expected: false,
+		},
+		{
+			name: "rule without resourceNames matches any name",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"get"},
+				APIGroups: []string{""},
+				Resources: []string{"secrets"},
+			},
+			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "secrets", ResourceName: "my-secret"},
+			expected: true,
+		},
+		{
+			name: "non-resource URL exact match",
+			rule: rbacv1.PolicyRule{
+				Verbs:           []string{"get"},
+				NonResourceURLs: []string{"/healthz"},
+			},
+			request:  PermissionRequest{Verb: "get", NonResourceURL: "/healthz"},
+			expected: true,
+		},
+		{
+			name: "non-resource URL prefix wildcard match",
+			rule: rbacv1.PolicyRule{
+				Verbs:           []string{"get"},
+				NonResourceURLs: []string{"/api/*"},
+			},
+			request:  PermissionRequest{Verb: "get", NonResourceURL: "/api/v1"},
+			expected: true,
+		},
+		{
+			name: "non-resource URL wildcard matches any path",
+			rule: rbacv1.PolicyRule{
+				Verbs:           []string{"get"},
+				NonResourceURLs: []string{"*"},
+			},
+			request:  PermissionRequest{Verb: "get", NonResourceURL: "/metrics"},
+			expected: true,
+		},
+		{
+			name: "non-resource URL no match - different path",
+			rule: rbacv1.PolicyRule{
+				Verbs:           []string{"get"},
+				NonResourceURLs: []string{"/healthz"},
+			},
+			request:  PermissionRequest{Verb: "get", NonResourceURL: "/metrics"},
+			expected: false,
+		},
+		{
+			name: "non-resource URL no match - wrong verb",
+			rule: rbacv1.PolicyRule{
+				Verbs:           []string{"post"},
+				NonResourceURLs: []string{"/healthz"},
+			},
+			request:  PermissionRequest{Verb: "get", NonResourceURL: "/healthz"},
+			expected: false,
+		},
+		{
+			// A wildcard resource rule does not imply non-resource URL access.
+			name: "wildcard resource rule does not grant a non-resource URL",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"get"},
+				APIGroups: []string{"*"},
+				Resources: []string{"*"},
+			},
+			request:  PermissionRequest{Verb: "get", NonResourceURL: "/healthz"},
+			expected: false,
 		},
 	}
 

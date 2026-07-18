@@ -52,11 +52,12 @@ type Printer interface {
 	Print(w io.Writer, result *rbac.PermissionResult, ctx *ContextInfo) error
 }
 
-// NewPrinter creates a printer based on the output format
-func NewPrinter(format string) (Printer, error) {
+// NewPrinter creates a printer based on the output format. color enables ANSI
+// coloring for the text printer (ignored by other formats).
+func NewPrinter(format string, color bool) (Printer, error) {
 	switch format {
 	case "text", "":
-		return &TextPrinter{}, nil
+		return &TextPrinter{Color: color}, nil
 	case "json":
 		return &JSONPrinter{}, nil
 	case "yaml":
@@ -70,8 +71,11 @@ func NewPrinter(format string) (Printer, error) {
 	}
 }
 
-// TextPrinter outputs human-readable text
-type TextPrinter struct{}
+// TextPrinter outputs human-readable text. Color enables ANSI coloring of the
+// ALLOWED/DENIED verdict.
+type TextPrinter struct {
+	Color bool
+}
 
 func (p *TextPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *ContextInfo) error {
 	// If using current context (--as not provided), show context info first
@@ -95,7 +99,8 @@ func (p *TextPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Con
 	}
 
 	if result.Incomplete() {
-		_, _ = fmt.Fprintf(w, "WARNING: resolution is incomplete, %d RBAC object(s) could not be read:\n", len(result.Errors))
+		_, _ = fmt.Fprintf(w, "%s: resolution is incomplete, %d RBAC object(s) could not be read:\n",
+			colorize(p.Color, colorYellow, "WARNING"), len(result.Errors))
 		for _, e := range result.Errors {
 			_, _ = fmt.Fprintf(w, "  - %v\n", e)
 		}
@@ -104,12 +109,14 @@ func (p *TextPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Con
 
 	if !result.Allowed {
 		if result.Incomplete() {
-			_, _ = fmt.Fprintf(w, "INCOMPLETE: no readable RBAC rule grants %s %s to %s, but not all RBAC objects could be read; this is NOT a definitive denial\n",
+			_, _ = fmt.Fprintf(w, "%s: no readable RBAC rule grants %s %s to %s, but not all RBAC objects could be read; this is NOT a definitive denial\n",
+				colorize(p.Color, colorYellow, "INCOMPLETE"),
 				result.Request.Verb,
 				formatResource(result.Request),
 				result.Subject.String())
 		} else {
-			_, _ = fmt.Fprintf(w, "DENIED: No RBAC rules grant %s %s to %s\n",
+			_, _ = fmt.Fprintf(w, "%s: No RBAC rules grant %s %s to %s\n",
+				colorize(p.Color, colorRed, "DENIED"),
 				result.Request.Verb,
 				formatResource(result.Request),
 				result.Subject.String())
@@ -120,7 +127,8 @@ func (p *TextPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Con
 		return nil
 	}
 
-	_, _ = fmt.Fprintf(w, "ALLOWED: %s can %s %s",
+	_, _ = fmt.Fprintf(w, "%s: %s can %s %s",
+		colorize(p.Color, colorGreen, "ALLOWED"),
 		result.Subject.String(),
 		result.Request.Verb,
 		formatResource(result.Request))
@@ -159,6 +167,9 @@ func (p *TextPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Con
 }
 
 func formatResource(request rbac.PermissionRequest) string {
+	if request.NonResourceURL != "" {
+		return request.NonResourceURL
+	}
 	resource := request.Resource
 	if request.Subresource != "" {
 		resource = resource + "/" + request.Subresource
@@ -191,8 +202,22 @@ func formatRule(rule rbacv1.PolicyRule) string {
 	if len(rule.ResourceNames) > 0 {
 		parts = append(parts, fmt.Sprintf("resourceNames=%v", rule.ResourceNames))
 	}
+	if len(rule.NonResourceURLs) > 0 {
+		parts = append(parts, fmt.Sprintf("nonResourceURLs=%v", rule.NonResourceURLs))
+	}
 
 	return strings.Join(parts, ", ")
+}
+
+// ruleToOutput converts a PolicyRule into its JSON/YAML output form.
+func ruleToOutput(rule rbacv1.PolicyRule) RuleOutput {
+	return RuleOutput{
+		Verbs:           rule.Verbs,
+		APIGroups:       rule.APIGroups,
+		Resources:       rule.Resources,
+		ResourceNames:   rule.ResourceNames,
+		NonResourceURLs: rule.NonResourceURLs,
+	}
 }
 
 // ContextOutput is the structure for context info in JSON/YAML output
@@ -317,12 +342,13 @@ type SubjectOutput struct {
 }
 
 type RequestOutput struct {
-	Verb         string `json:"verb"`
-	APIGroup     string `json:"apiGroup"`
-	Resource     string `json:"resource"`
-	Subresource  string `json:"subresource,omitempty"`
-	ResourceName string `json:"resourceName,omitempty"`
-	Namespace    string `json:"namespace,omitempty"`
+	Verb           string `json:"verb"`
+	APIGroup       string `json:"apiGroup"`
+	Resource       string `json:"resource"`
+	Subresource    string `json:"subresource,omitempty"`
+	ResourceName   string `json:"resourceName,omitempty"`
+	Namespace      string `json:"namespace,omitempty"`
+	NonResourceURL string `json:"nonResourceURL,omitempty"`
 }
 
 type GrantOutput struct {
@@ -345,10 +371,11 @@ type RoleOutput struct {
 }
 
 type RuleOutput struct {
-	Verbs         []string `json:"verbs"`
-	APIGroups     []string `json:"apiGroups"`
-	Resources     []string `json:"resources"`
-	ResourceNames []string `json:"resourceNames,omitempty"`
+	Verbs           []string `json:"verbs"`
+	APIGroups       []string `json:"apiGroups"`
+	Resources       []string `json:"resources"`
+	ResourceNames   []string `json:"resourceNames,omitempty"`
+	NonResourceURLs []string `json:"nonResourceURLs,omitempty"`
 }
 
 // buildStructuredOutput assembles the serialisable representation shared by
@@ -363,12 +390,13 @@ func buildStructuredOutput(result *rbac.PermissionResult, ctx *ContextInfo) JSON
 			Namespace: result.Subject.Namespace,
 		},
 		Request: RequestOutput{
-			Verb:         result.Request.Verb,
-			APIGroup:     result.Request.APIGroup,
-			Resource:     result.Request.Resource,
-			Subresource:  result.Request.Subresource,
-			ResourceName: result.Request.ResourceName,
-			Namespace:    result.Request.Namespace,
+			Verb:           result.Request.Verb,
+			APIGroup:       result.Request.APIGroup,
+			Resource:       result.Request.Resource,
+			Subresource:    result.Request.Subresource,
+			ResourceName:   result.Request.ResourceName,
+			Namespace:      result.Request.Namespace,
+			NonResourceURL: result.Request.NonResourceURL,
 		},
 		Grants: make([]GrantOutput, 0, len(result.Grants)),
 	}
@@ -390,13 +418,8 @@ func buildStructuredOutput(result *rbac.PermissionResult, ctx *ContextInfo) JSON
 				Name:      grant.Role.Name,
 				Namespace: grant.Role.Namespace,
 			},
-			MatchingRule: RuleOutput{
-				Verbs:         grant.MatchingRule.Verbs,
-				APIGroups:     grant.MatchingRule.APIGroups,
-				Resources:     grant.MatchingRule.Resources,
-				ResourceNames: grant.MatchingRule.ResourceNames,
-			},
-			Scope: string(grant.Scope),
+			MatchingRule: ruleToOutput(grant.MatchingRule),
+			Scope:        string(grant.Scope),
 		}
 		output.Grants = append(output.Grants, grantOutput)
 	}
