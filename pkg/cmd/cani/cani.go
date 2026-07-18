@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/rest"
+	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 
 	"github.com/hardik/kubectl-rbac-why/pkg/client"
 	"github.com/hardik/kubectl-rbac-why/pkg/output"
@@ -44,6 +46,9 @@ context to determine the subject.`
   # Check pod exec permissions for current user
   kubectl rbac-why can-i create pods/exec -n default
 
+  # Check access to one specific secret (matches RBAC resourceNames rules)
+  kubectl rbac-why can-i get secrets db-password -n default
+
   # Output as JSON for programmatic use
   kubectl rbac-why can-i get pods -o json
 
@@ -65,7 +70,7 @@ func NewCmdRbacWhy(streams genericclioptions.IOStreams) *cobra.Command {
 	o := NewRbacWhyOptions(streams)
 
 	cmd := &cobra.Command{
-		Use:     "rbac-why can-i [--as SUBJECT] VERB RESOURCE [flags]",
+		Use:     "rbac-why can-i [--as SUBJECT] VERB RESOURCE [NAME] [flags]",
 		Short:   "Explain why a permission is granted in RBAC",
 		Long:    longDesc,
 		Example: examples,
@@ -91,6 +96,7 @@ func NewCmdRbacWhy(streams genericclioptions.IOStreams) *cobra.Command {
 
 	// Add our custom flags
 	cmd.Flags().StringVarP(&o.Output, "output", "o", "text", "Output format: text, json, yaml, dot, mermaid")
+	cmd.Flags().StringVar(&o.Subresource, "subresource", "", "Subresource to check (e.g. status, log, exec); alternative to RESOURCE/SUBRESOURCE syntax")
 	cmd.Flags().BoolVar(&o.ShowRisky, "show-risky", false, "Analyze and show risky permissions for the subject")
 	cmd.Flags().StringVarP(&o.AWSProfile, "profile", "p", "", "AWS profile to use for authentication (for EKS clusters)")
 	cmd.Flags().StringVar(&o.ClusterName, "cluster-name", "", "EKS cluster name (overrides auto-detection from kubeconfig)")
@@ -102,28 +108,25 @@ func NewCmdRbacWhy(streams genericclioptions.IOStreams) *cobra.Command {
 
 // Run executes the rbac-why command
 func (o *RbacWhyOptions) Run(ctx context.Context) error {
-	// Create Kubernetes client WITHOUT impersonation
-	// We need to read RBAC resources with the actual user's permissions,
-	// not as the subject being checked
-	savedImpersonate := o.ConfigFlags.Impersonate
-	savedImpersonateGroup := o.ConfigFlags.ImpersonateGroup
-	savedImpersonateUID := o.ConfigFlags.ImpersonateUID
-
-	// Temporarily clear impersonation settings
-	emptyString := ""
-	o.ConfigFlags.Impersonate = &emptyString
-	o.ConfigFlags.ImpersonateGroup = &[]string{}
-	o.ConfigFlags.ImpersonateUID = &emptyString
-
 	restConfig, err := o.ConfigFlags.ToRESTConfig()
 	if err != nil {
 		return fmt.Errorf("failed to create REST config: %w", err)
 	}
 
-	// Restore impersonation settings
-	o.ConfigFlags.Impersonate = savedImpersonate
-	o.ConfigFlags.ImpersonateGroup = savedImpersonateGroup
-	o.ConfigFlags.ImpersonateUID = savedImpersonateUID
+	// Create the Kubernetes client WITHOUT impersonation: RBAC objects must
+	// be read with the caller's real permissions, never as the subject being
+	// investigated (which would limit the walk to whatever the subject can
+	// see). Clearing the built config is the reliable way to do this;
+	// ConfigFlags caches its kubeconfig loader, so clearing the flag values
+	// before ToRESTConfig does not work once the loader has been built.
+	restConfig.Impersonate = rest.ImpersonationConfig{}
+
+	// Make the kubeconfig's AWS exec credential plugin honor --profile, so
+	// the Kubernetes client authenticates as the same AWS principal that the
+	// local STS/EKS identity lookups use.
+	if o.AWSProfile != "" {
+		injectAWSProfile(restConfig, o.AWSProfile)
+	}
 
 	// Build an EKS client once and reuse it for both identity resolution
 	// and ServiceAccount enrichment. nil if EKS isn't applicable (no
@@ -131,9 +134,25 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 	eksClient := o.maybeBuildEKSClient(ctx)
 
 	// For AWS IAM auth, resolve the K8s identity by walking the priority
-	// chain: Access Entry → aws-auth → Pod Identity → raw IAM ARN.
+	// chain: Access Entry -> aws-auth -> raw IAM ARN.
 	if !o.AsProvided && o.CurrentContext != nil && o.CurrentContext.AuthMethod == "aws-iam" && o.CurrentContext.AWSIamArn != "" {
 		o.orchestrateAWSIdentity(ctx, restConfig, eksClient)
+	}
+
+	// When the kubeconfig couldn't yield a real identity (token, generic
+	// exec, OIDC/auth-provider), the fallback is just the authInfo entry
+	// name, which has no required relationship to the authenticated user.
+	// Ask the API server who we are instead.
+	if !o.AsProvided && o.CurrentContext != nil && !o.CurrentContext.IdentityResolved {
+		if userName, groups, ssrErr := resolveSelfSubject(ctx, restConfig); ssrErr != nil {
+			_, _ = fmt.Fprintf(o.ErrOut, "Warning: SelfSubjectReview failed (%v); falling back to kubeconfig authInfo name %q which may not match the authenticated identity\n", ssrErr, o.As)
+		} else {
+			o.As = userName
+			o.CurrentContext.UserName = userName
+			o.CurrentContext.Groups = groups
+			o.CurrentContext.AuthMethod += " (identity via SelfSubjectReview)"
+			o.CurrentContext.IdentityResolved = true
+		}
 	}
 
 	// Parse the subject
@@ -160,6 +179,11 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 		subject.Groups = o.CurrentContext.Groups
 	}
 
+	// --as-group values accompany an explicit --as subject
+	if o.AsProvided && len(o.AsGroups) > 0 {
+		subject.Groups = o.AsGroups
+	}
+
 	rbacClient, err := client.NewK8sRBACClient(restConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create RBAC client: %w", err)
@@ -169,14 +193,28 @@ func (o *RbacWhyOptions) Run(ctx context.Context) error {
 
 	// Handle --show-risky flag
 	if o.ShowRisky {
-		return o.runRiskyAnalysis(ctx, resolver, subject)
+		return o.runRiskyAnalysis(ctx, rbacClient, resolver, subject)
 	}
 
-	// Normal permission check
+	// Normal permission check. Align the request with the cluster's API
+	// surface first (resolve the API group, drop the namespace for
+	// cluster-scoped resources).
 	request := o.ToPermissionRequest()
+	o.applyDiscovery(restConfig, &request)
+
 	result, err := resolver.ResolvePermission(ctx, subject, request)
 	if err != nil {
 		return fmt.Errorf("failed to resolve permission: %w", err)
+	}
+
+	// EKS access policies grant permissions additively with RBAC; fold any
+	// matching policy grants into the result so an access-policy-only admin
+	// isn't reported as denied.
+	if o.CurrentContext != nil && len(o.CurrentContext.AccessPolicies) > 0 {
+		policyGrants, policyErrs := accessPolicyGrants(ctx, rbacClient, o.CurrentContext.AccessPolicies, o.CurrentContext.AWSIamArn, request.Namespace, &request)
+		result.Grants = append(result.Grants, policyGrants...)
+		result.Errors = append(result.Errors, policyErrs...)
+		result.Allowed = len(result.Grants) > 0
 	}
 
 	// Print result
@@ -261,13 +299,15 @@ func (o *RbacWhyOptions) maybeBuildEKSClient(ctx context.Context) EKSAPI {
 //
 //  1. EKS Access Entries (modern; via DescribeAccessEntry)
 //  2. aws-auth ConfigMap (legacy)
-//  3. EKS Pod Identity reverse-lookup (when the IAM principal is a role
-//     bound to a ServiceAccount via Pod Identity)
-//  4. Raw IAM ARN (fallback — same as today's behavior)
+//  3. Raw IAM ARN (fallback, same as today's behavior)
+//
+// Pod Identity associations are surfaced informationally only: Pod Identity
+// supplies AWS credentials to pods and does not authenticate an IAM caller as
+// the associated ServiceAccount (the same role can also back several SAs).
 //
 // On any per-step error other than "not found", a one-line warning goes to
 // ErrOut and resolution falls through to the next step. The function never
-// returns an error — failures degrade gracefully, preserving today's
+// returns an error, failures degrade gracefully, preserving today's
 // behavior on non-EKS clusters and clusters without EKS API permissions.
 func (o *RbacWhyOptions) orchestrateAWSIdentity(ctx context.Context, restConfig *rest.Config, eksClient EKSAPI) {
 	arn := o.CurrentContext.AWSIamArn
@@ -276,9 +316,12 @@ func (o *RbacWhyOptions) orchestrateAWSIdentity(ctx context.Context, restConfig 
 	// 1. EKS Access Entries
 	if eksClient != nil && clusterName != "" {
 		ae, err := ResolveAccessEntryIdentity(ctx, eksClient, clusterName, arn)
-		if err != nil {
-			_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to query EKS Access Entries: %v\n", err)
-		} else if ae.Found {
+		if ae != nil && ae.Found {
+			// The username/groups are authoritative even if listing the
+			// associated policies failed; don't discard the identity.
+			if err != nil {
+				_, _ = fmt.Fprintf(o.ErrOut, "Warning: %v\n", err)
+			}
 			o.As = ae.KubernetesUsername
 			o.CurrentContext.UserName = ae.KubernetesUsername
 			o.CurrentContext.Groups = ae.KubernetesGroups
@@ -286,6 +329,9 @@ func (o *RbacWhyOptions) orchestrateAWSIdentity(ctx context.Context, restConfig 
 			o.CurrentContext.AccessEntryFound = true
 			o.CurrentContext.AccessPolicies = ae.AccessPolicies
 			return
+		}
+		if err != nil {
+			_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to query EKS Access Entries: %v\n", err)
 		}
 	}
 
@@ -299,34 +345,28 @@ func (o *RbacWhyOptions) orchestrateAWSIdentity(ctx context.Context, restConfig 
 		o.CurrentContext.AuthMethod = "aws-iam (via aws-auth)"
 		return
 	case err == nil && !identity.Found:
-		// aws-auth exists but has no entry for this principal; advance
-		// to Pod Identity reverse-lookup before giving up.
+		// aws-auth exists but has no entry for this principal.
 	case errors.Is(err, ErrAwsAuthNotFound):
 		// Modern EKS clusters use Access Entries only and have no
-		// aws-auth ConfigMap. This is normal — no warning.
+		// aws-auth ConfigMap. This is normal, no warning.
 	default:
 		_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to read aws-auth ConfigMap: %v\n", err)
 	}
 
-	// 3. Pod Identity reverse-lookup (IAM role → ServiceAccount).
-	// Only meaningful when the caller is acting as an IAM role.
+	// Informational: note Pod Identity associations for this IAM role so the
+	// output can hint at where the role is used. This never rewrites the
+	// caller's identity.
 	if eksClient != nil && clusterName != "" {
 		if matches, perr := FindPodIdentityByRole(ctx, eksClient, clusterName, arn); perr != nil {
 			_, _ = fmt.Fprintf(o.ErrOut, "Warning: failed to scan Pod Identity associations: %v\n", perr)
-		} else if len(matches) == 1 {
-			m := matches[0]
-			o.As = "system:serviceaccount:" + m.Namespace + ":" + m.ServiceAccount
-			o.CurrentContext.UserName = o.As
-			o.CurrentContext.Groups = nil
-			o.CurrentContext.AuthMethod = "aws-iam (via Pod Identity)"
-			o.CurrentContext.PodIdentityForRole = &m
-			return
-		} else if len(matches) > 1 {
-			_, _ = fmt.Fprintf(o.ErrOut, "Warning: %d Pod Identity associations match this IAM role; ambiguous — falling back to raw IAM ARN\n", len(matches))
+		} else if len(matches) > 0 {
+			o.CurrentContext.PodIdentityForRole = &matches[0]
+			_, _ = fmt.Fprintf(o.ErrOut, "Note: this IAM role backs %d Pod Identity association(s) (e.g. %s/%s); that does not authenticate this caller as that ServiceAccount\n",
+				len(matches), matches[0].Namespace, matches[0].ServiceAccount)
 		}
 	}
 
-	// 4. Raw IAM ARN fallback
+	// 3. Raw IAM ARN fallback
 	if identity != nil && !identity.Found {
 		// aws-auth was readable but had no mapping
 		o.As = identity.Username
@@ -341,13 +381,51 @@ func (o *RbacWhyOptions) orchestrateAWSIdentity(ctx context.Context, restConfig 
 }
 
 // runRiskyAnalysis shows risky permissions for a subject
-func (o *RbacWhyOptions) runRiskyAnalysis(ctx context.Context, resolver *rbac.Resolver, subject rbac.Subject) error {
-	grants, err := resolver.ResolveAllPermissions(ctx, subject, o.Namespace)
+func (o *RbacWhyOptions) runRiskyAnalysis(ctx context.Context, rbacClient client.RBACClient, resolver *rbac.Resolver, subject rbac.Subject) error {
+	grants, resolveErrs, err := resolver.ResolveAllPermissions(ctx, subject, o.Namespace)
 	if err != nil {
 		return fmt.Errorf("failed to resolve permissions: %w", err)
 	}
 
+	// EKS access policies grant permissions outside the RBAC object chain;
+	// include their effective rules so the risk report covers them.
+	if o.CurrentContext != nil && len(o.CurrentContext.AccessPolicies) > 0 {
+		policyGrants, policyErrs := accessPolicyGrants(ctx, rbacClient, o.CurrentContext.AccessPolicies, o.CurrentContext.AWSIamArn, o.Namespace, nil)
+		grants = append(grants, policyGrants...)
+		resolveErrs = append(resolveErrs, policyErrs...)
+	}
+
 	risks := output.AnalyzeRiskyPermissions(grants)
-	output.PrintRiskyPermissions(o.Out, risks)
+	output.PrintRiskyPermissions(o.Out, risks, resolveErrs)
 	return nil
+}
+
+// injectAWSProfile rewrites the REST config's AWS exec credential plugin so
+// it uses the given profile: an existing --profile argument is replaced,
+// otherwise AWS_PROFILE is set in the plugin's environment. No-op for
+// non-AWS exec plugins.
+func injectAWSProfile(restConfig *rest.Config, profile string) {
+	execProvider := restConfig.ExecProvider
+	if execProvider == nil || !isAWSAuth(execProvider) {
+		return
+	}
+
+	for i, arg := range execProvider.Args {
+		if arg == "--profile" && i+1 < len(execProvider.Args) {
+			execProvider.Args[i+1] = profile
+			return
+		}
+		if strings.HasPrefix(arg, "--profile=") {
+			execProvider.Args[i] = "--profile=" + profile
+			return
+		}
+	}
+
+	for i, env := range execProvider.Env {
+		if env.Name == "AWS_PROFILE" {
+			execProvider.Env[i].Value = profile
+			return
+		}
+	}
+	execProvider.Env = append(execProvider.Env, clientcmdapi.ExecEnvVar{Name: "AWS_PROFILE", Value: profile})
 }

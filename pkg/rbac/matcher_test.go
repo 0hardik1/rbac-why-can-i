@@ -64,14 +64,34 @@ func TestRuleMatches(t *testing.T) {
 			expected: true,
 		},
 		{
-			name: "subresource wildcard",
+			name: "subresource wildcard star-slash form",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"get"},
+				APIGroups: []string{""},
+				Resources: []string{"*/log"},
+			},
+			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "pods", Subresource: "log"},
+			expected: true,
+		},
+		{
+			name: "pods/* is not a wildcard in Kubernetes",
 			rule: rbacv1.PolicyRule{
 				Verbs:     []string{"get"},
 				APIGroups: []string{""},
 				Resources: []string{"pods/*"},
 			},
 			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "pods", Subresource: "log"},
-			expected: true,
+			expected: false,
+		},
+		{
+			name: "star-slash form does not match base resource",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"get"},
+				APIGroups: []string{""},
+				Resources: []string{"*/scale"},
+			},
+			request:  PermissionRequest{Verb: "get", APIGroup: "apps", Resource: "deployments"},
+			expected: false,
 		},
 		{
 			name: "resource name match",
@@ -94,6 +114,27 @@ func TestRuleMatches(t *testing.T) {
 			},
 			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "secrets", ResourceName: "other-secret"},
 			expected: false,
+		},
+		{
+			name: "resourceNames rule does not match request without a name",
+			rule: rbacv1.PolicyRule{
+				Verbs:         []string{"get"},
+				APIGroups:     []string{""},
+				Resources:     []string{"secrets"},
+				ResourceNames: []string{"my-secret"},
+			},
+			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "secrets"},
+			expected: false,
+		},
+		{
+			name: "rule without resourceNames matches any name",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"get"},
+				APIGroups: []string{""},
+				Resources: []string{"secrets"},
+			},
+			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "secrets", ResourceName: "my-secret"},
+			expected: true,
 		},
 		{
 			name: "no match - different verb",
@@ -369,6 +410,34 @@ func TestGetImplicitGroups(t *testing.T) {
 			expectedGroups: []string{
 				"system:authenticated",
 			},
+		},
+		{
+			name: "anonymous user is unauthenticated",
+			subject: Subject{
+				Kind: "User",
+				Name: "system:anonymous",
+			},
+			expectedGroups: []string{
+				"system:unauthenticated",
+			},
+		},
+		{
+			name: "system component user is authenticated",
+			subject: Subject{
+				Kind: "User",
+				Name: "system:kube-scheduler",
+			},
+			expectedGroups: []string{
+				"system:authenticated",
+			},
+		},
+		{
+			name: "group subject has no implicit memberships",
+			subject: Subject{
+				Kind: "Group",
+				Name: "system:masters",
+			},
+			expectedGroups: []string{},
 		},
 	}
 

@@ -27,6 +27,11 @@ type ContextInfo struct {
 	AuthMethod  string // e.g., "client-certificate", "token", "exec", etc.
 	AWSIamArn   string // For AWS IAM auth: the IAM ARN before aws-auth mapping
 
+	// IdentityResolved is false when UserName is only the kubeconfig authInfo
+	// name (token/exec/auth-provider auth), not an actual identity. Run then
+	// asks the API server who we are via SelfSubjectReview.
+	IdentityResolved bool
+
 	// EKS-specific fields (populated when running against an EKS cluster).
 	EKSClusterName     string
 	EKSRegion          string
@@ -44,14 +49,18 @@ type RbacWhyOptions struct {
 	// Whether --as was explicitly provided (false means using current context)
 	AsProvided bool
 
+	// Groups from --as-group, attached to the subject when --as is provided
+	AsGroups []string
+
 	// Current context information (populated when --as is not provided)
 	CurrentContext *ContextInfo
 
 	// Permission request
-	Verb        string
-	Resource    string
-	Subresource string
-	APIGroup    string
+	Verb         string
+	Resource     string
+	Subresource  string
+	APIGroup     string
+	ResourceName string
 
 	// Namespace
 	Namespace string
@@ -87,7 +96,10 @@ func (o *RbacWhyOptions) Complete(args []string) error {
 	// For --show-risky, we don't need VERB RESOURCE
 	if !o.ShowRisky {
 		if len(args) < 2 {
-			return fmt.Errorf("requires at least 2 arguments: VERB RESOURCE")
+			return fmt.Errorf("requires at least 2 arguments: VERB RESOURCE [NAME]")
+		}
+		if len(args) > 3 {
+			return fmt.Errorf("too many arguments: expected VERB RESOURCE [NAME]")
 		}
 
 		o.Verb = args[0]
@@ -97,6 +109,10 @@ func (o *RbacWhyOptions) Complete(args []string) error {
 		if err := o.parseResource(resourceArg); err != nil {
 			return err
 		}
+
+		if len(args) == 3 {
+			o.ResourceName = args[2]
+		}
 	}
 
 	// Get --as value from ConfigFlags
@@ -105,9 +121,20 @@ func (o *RbacWhyOptions) Complete(args []string) error {
 		o.AsProvided = true
 	}
 
-	// Get namespace from ConfigFlags
-	if o.ConfigFlags.Namespace != nil && *o.ConfigFlags.Namespace != "" {
+	// Get --as-group values; they participate in group-based binding matches
+	if o.ConfigFlags.ImpersonateGroup != nil && len(*o.ConfigFlags.ImpersonateGroup) > 0 {
+		o.AsGroups = append([]string(nil), (*o.ConfigFlags.ImpersonateGroup)...)
+	}
+
+	// Resolve the effective namespace the way kubectl does: -n flag, then the
+	// kubeconfig context's namespace, then "default". Cluster-scoped requests
+	// have the namespace cleared later via API discovery.
+	if ns, _, err := o.ConfigFlags.ToRawKubeConfigLoader().Namespace(); err == nil && ns != "" {
+		o.Namespace = ns
+	} else if o.ConfigFlags.Namespace != nil && *o.ConfigFlags.Namespace != "" {
 		o.Namespace = *o.ConfigFlags.Namespace
+	} else {
+		o.Namespace = "default"
 	}
 
 	// If --as is not provided, get subject from current context
@@ -150,17 +177,18 @@ func (o *RbacWhyOptions) completeFromCurrentContext() error {
 	}
 
 	// Try to determine the actual user identity
-	userName, groups, authMethod := extractUserIdentity(authInfo, authInfoName, o.AWSProfile)
+	userName, groups, authMethod, resolved := extractUserIdentity(authInfo, authInfoName, o.AWSProfile)
 
 	// Store context info for display
 	o.CurrentContext = &ContextInfo{
-		ContextName: currentContextName,
-		ClusterName: currentContext.Cluster,
-		AuthInfo:    authInfoName,
-		UserName:    userName,
-		Groups:      groups,
-		Namespace:   currentContext.Namespace,
-		AuthMethod:  authMethod,
+		ContextName:      currentContextName,
+		ClusterName:      currentContext.Cluster,
+		AuthInfo:         authInfoName,
+		UserName:         userName,
+		Groups:           groups,
+		Namespace:        currentContext.Namespace,
+		AuthMethod:       authMethod,
+		IdentityResolved: resolved,
 	}
 
 	// For AWS IAM auth, store the IAM ARN for later aws-auth lookup
@@ -185,21 +213,19 @@ func (o *RbacWhyOptions) completeFromCurrentContext() error {
 	// Use the extracted user name as the subject
 	o.As = userName
 
-	// If namespace not specified via flag, use context's default namespace
-	if o.Namespace == "" && currentContext.Namespace != "" {
-		o.Namespace = currentContext.Namespace
-	}
-
 	return nil
 }
 
-// extractUserIdentity tries to determine the actual user identity from authInfo
-// Returns: userName, groups, authMethod
-func extractUserIdentity(authInfo *api.AuthInfo, fallbackName string, awsProfile string) (string, []string, string) {
+// extractUserIdentity tries to determine the actual user identity from authInfo.
+// Returns: userName, groups, authMethod, resolved. When resolved is false the
+// userName is only the kubeconfig authInfo entry name, which has no required
+// relationship to the authenticated identity; callers should confirm the real
+// identity with the API server (SelfSubjectReview).
+func extractUserIdentity(authInfo *api.AuthInfo, fallbackName string, awsProfile string) (string, []string, string, bool) {
 	// Try client certificate first (most common for local clusters like Docker Desktop, kind, minikube)
 	if len(authInfo.ClientCertificateData) > 0 {
 		if userName, groups, err := parseClientCertificate(authInfo.ClientCertificateData); err == nil {
-			return userName, groups, "client-certificate"
+			return userName, groups, "client-certificate", true
 		}
 	}
 
@@ -208,14 +234,14 @@ func extractUserIdentity(authInfo *api.AuthInfo, fallbackName string, awsProfile
 		certData, err := os.ReadFile(authInfo.ClientCertificate)
 		if err == nil {
 			if userName, groups, err := parseClientCertificate(certData); err == nil {
-				return userName, groups, "client-certificate"
+				return userName, groups, "client-certificate", true
 			}
 		}
 	}
 
 	// Token-based auth - we can't determine the user without calling the API
 	if authInfo.Token != "" || authInfo.TokenFile != "" {
-		return fallbackName, nil, "token"
+		return fallbackName, nil, "token", false
 	}
 
 	// Exec-based auth (e.g., aws-iam-authenticator, gcloud)
@@ -223,20 +249,20 @@ func extractUserIdentity(authInfo *api.AuthInfo, fallbackName string, awsProfile
 		// Try to extract identity for AWS IAM authenticator
 		if isAWSAuth(authInfo.Exec) {
 			if userName, groups, err := extractAWSIdentity(authInfo.Exec, awsProfile); err == nil {
-				return userName, groups, "aws-iam"
+				return userName, groups, "aws-iam", true
 			}
 			// Fall through to fallback if AWS identity extraction fails
 		}
-		return fallbackName, nil, "exec (" + authInfo.Exec.Command + ")"
+		return fallbackName, nil, "exec (" + authInfo.Exec.Command + ")", false
 	}
 
 	// Auth provider (e.g., oidc, gcp)
 	if authInfo.AuthProvider != nil {
-		return fallbackName, nil, "auth-provider (" + authInfo.AuthProvider.Name + ")"
+		return fallbackName, nil, "auth-provider (" + authInfo.AuthProvider.Name + ")", false
 	}
 
 	// Fallback to the authInfo name
-	return fallbackName, nil, "unknown"
+	return fallbackName, nil, "unknown", false
 }
 
 // parseClientCertificate extracts the CN (user) and O (groups) from a client certificate
@@ -269,7 +295,12 @@ func isAWSAuth(execConfig *api.ExecConfig) bool {
 	if cmd == "aws-iam-authenticator" || strings.HasSuffix(cmd, "/aws-iam-authenticator") {
 		return true
 	}
-	// Check for aws eks get-token
+	return isEKSGetToken(execConfig)
+}
+
+// isEKSGetToken checks if the exec config runs `aws eks get-token`
+func isEKSGetToken(execConfig *api.ExecConfig) bool {
+	cmd := execConfig.Command
 	if cmd == "aws" || strings.HasSuffix(cmd, "/aws") {
 		for i, arg := range execConfig.Args {
 			if arg == "eks" && i+1 < len(execConfig.Args) && execConfig.Args[i+1] == "get-token" {
@@ -331,10 +362,17 @@ func extractAWSIdentity(execConfig *api.ExecConfig, awsProfile string) (string, 
 	// If a role is specified in the exec config, use that role ARN
 	// The actual username in K8s will be the assumed-role ARN
 	if roleArn != "" {
-		// For assumed roles, Kubernetes username format is:
-		// arn:aws:sts::ACCOUNT:assumed-role/ROLE-NAME/SESSION-NAME
-		// The session name varies, but we can construct a pattern
-		userName := convertRoleToAssumedRoleArn(roleArn, response.Account)
+		// For assumed roles, the Kubernetes-visible caller ARN is
+		// arn:PARTITION:sts::ACCOUNT:assumed-role/ROLE-NAME/SESSION-NAME.
+		// Partition and account come from the role ARN itself (the role may
+		// live in another account or partition than the base caller).
+		// `aws eks get-token` always uses the session name EKSGetTokenAuth;
+		// for other tools the session is unknowable and omitted.
+		sessionName := ""
+		if isEKSGetToken(execConfig) {
+			sessionName = "EKSGetTokenAuth"
+		}
+		userName := convertRoleToAssumedRoleArn(roleArn, response.Account, sessionName)
 		return userName, nil, nil
 	}
 
@@ -379,8 +417,14 @@ func extractProfileFromArgs(args []string) string {
 
 // parseResource parses a resource string like "pods", "pods/log", "deployments.apps"
 func (o *RbacWhyOptions) parseResource(resource string) error {
-	// Handle subresource (e.g., "pods/exec")
+	// Handle subresource (e.g., "pods/exec"). Note this differs from
+	// `kubectl auth can-i`, where TYPE/NAME denotes a resource name; here the
+	// resource name is the optional third argument and --subresource is also
+	// accepted for kubectl parity.
 	if idx := strings.Index(resource, "/"); idx != -1 {
+		if o.Subresource != "" {
+			return fmt.Errorf("cannot combine RESOURCE/SUBRESOURCE syntax with --subresource")
+		}
 		o.Resource = resource[:idx]
 		o.Subresource = resource[idx+1:]
 		resource = o.Resource
@@ -432,10 +476,11 @@ func (o *RbacWhyOptions) Validate() error {
 // ToPermissionRequest converts options to a PermissionRequest
 func (o *RbacWhyOptions) ToPermissionRequest() rbac.PermissionRequest {
 	return rbac.PermissionRequest{
-		Verb:        o.Verb,
-		APIGroup:    o.APIGroup,
-		Resource:    o.Resource,
-		Subresource: o.Subresource,
-		Namespace:   o.Namespace,
+		Verb:         o.Verb,
+		APIGroup:     o.APIGroup,
+		Resource:     o.Resource,
+		Subresource:  o.Subresource,
+		ResourceName: o.ResourceName,
+		Namespace:    o.Namespace,
 	}
 }

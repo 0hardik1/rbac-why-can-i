@@ -6,8 +6,8 @@ import (
 	"io"
 	"strings"
 
-	"gopkg.in/yaml.v3"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"sigs.k8s.io/yaml"
 
 	"github.com/hardik/kubectl-rbac-why/pkg/rbac"
 )
@@ -94,11 +94,26 @@ func (p *TextPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Con
 		writeAWSIdentityContext(w, ctx)
 	}
 
+	if result.Incomplete() {
+		_, _ = fmt.Fprintf(w, "WARNING: resolution is incomplete, %d RBAC object(s) could not be read:\n", len(result.Errors))
+		for _, e := range result.Errors {
+			_, _ = fmt.Fprintf(w, "  - %v\n", e)
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+
 	if !result.Allowed {
-		_, _ = fmt.Fprintf(w, "DENIED: No RBAC rules grant %s %s to %s\n",
-			result.Request.Verb,
-			formatResource(result.Request),
-			result.Subject.String())
+		if result.Incomplete() {
+			_, _ = fmt.Fprintf(w, "INCOMPLETE: no readable RBAC rule grants %s %s to %s, but not all RBAC objects could be read; this is NOT a definitive denial\n",
+				result.Request.Verb,
+				formatResource(result.Request),
+				result.Subject.String())
+		} else {
+			_, _ = fmt.Fprintf(w, "DENIED: No RBAC rules grant %s %s to %s\n",
+				result.Request.Verb,
+				formatResource(result.Request),
+				result.Subject.String())
+		}
 		if result.Request.Namespace != "" {
 			_, _ = fmt.Fprintf(w, "Namespace: %s\n", result.Request.Namespace)
 		}
@@ -282,14 +297,17 @@ func writeAWSIdentityContext(w io.Writer, ctx *ContextInfo) {
 	_, _ = fmt.Fprintln(w)
 }
 
-// JSONOutput is the structure for JSON output
+// JSONOutput is the structure for JSON and YAML output
 type JSONOutput struct {
 	Context *ContextOutput `json:"context,omitempty"`
 	Allowed bool           `json:"allowed"`
-	Subject SubjectOutput  `json:"subject"`
-	Request RequestOutput  `json:"request"`
-	Grants  []GrantOutput  `json:"grants,omitempty"`
-	Errors  []string       `json:"errors,omitempty"`
+	// Incomplete is true when some RBAC objects could not be read; grants may
+	// be missing and allowed=false is not a definitive denial.
+	Incomplete bool          `json:"incomplete,omitempty"`
+	Subject    SubjectOutput `json:"subject"`
+	Request    RequestOutput `json:"request"`
+	Grants     []GrantOutput `json:"grants,omitempty"`
+	Errors     []string      `json:"errors,omitempty"`
 }
 
 type SubjectOutput struct {
@@ -333,120 +351,82 @@ type RuleOutput struct {
 	ResourceNames []string `json:"resourceNames,omitempty"`
 }
 
+// buildStructuredOutput assembles the serialisable representation shared by
+// the JSON and YAML printers.
+func buildStructuredOutput(result *rbac.PermissionResult, ctx *ContextInfo) JSONOutput {
+	output := JSONOutput{
+		Allowed:    result.Allowed,
+		Incomplete: result.Incomplete(),
+		Subject: SubjectOutput{
+			Kind:      result.Subject.Kind,
+			Name:      result.Subject.Name,
+			Namespace: result.Subject.Namespace,
+		},
+		Request: RequestOutput{
+			Verb:         result.Request.Verb,
+			APIGroup:     result.Request.APIGroup,
+			Resource:     result.Request.Resource,
+			Subresource:  result.Request.Subresource,
+			ResourceName: result.Request.ResourceName,
+			Namespace:    result.Request.Namespace,
+		},
+		Grants: make([]GrantOutput, 0, len(result.Grants)),
+	}
+
+	// Include context info if --as was not provided
+	if ctx != nil {
+		output.Context = contextOutputFromInfo(ctx)
+	}
+
+	for _, grant := range result.Grants {
+		grantOutput := GrantOutput{
+			Binding: BindingOutput{
+				Kind:      grant.Binding.Kind,
+				Name:      grant.Binding.Name,
+				Namespace: grant.Binding.Namespace,
+			},
+			Role: RoleOutput{
+				Kind:      grant.Role.Kind,
+				Name:      grant.Role.Name,
+				Namespace: grant.Role.Namespace,
+			},
+			MatchingRule: RuleOutput{
+				Verbs:         grant.MatchingRule.Verbs,
+				APIGroups:     grant.MatchingRule.APIGroups,
+				Resources:     grant.MatchingRule.Resources,
+				ResourceNames: grant.MatchingRule.ResourceNames,
+			},
+			Scope: string(grant.Scope),
+		}
+		output.Grants = append(output.Grants, grantOutput)
+	}
+
+	for _, err := range result.Errors {
+		output.Errors = append(output.Errors, err.Error())
+	}
+
+	return output
+}
+
 // JSONPrinter outputs JSON format
 type JSONPrinter struct{}
 
 func (p *JSONPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *ContextInfo) error {
-	output := JSONOutput{
-		Allowed: result.Allowed,
-		Subject: SubjectOutput{
-			Kind:      result.Subject.Kind,
-			Name:      result.Subject.Name,
-			Namespace: result.Subject.Namespace,
-		},
-		Request: RequestOutput{
-			Verb:         result.Request.Verb,
-			APIGroup:     result.Request.APIGroup,
-			Resource:     result.Request.Resource,
-			Subresource:  result.Request.Subresource,
-			ResourceName: result.Request.ResourceName,
-			Namespace:    result.Request.Namespace,
-		},
-		Grants: make([]GrantOutput, 0, len(result.Grants)),
-	}
-
-	// Include context info if --as was not provided
-	if ctx != nil {
-		output.Context = contextOutputFromInfo(ctx)
-	}
-
-	for _, grant := range result.Grants {
-		grantOutput := GrantOutput{
-			Binding: BindingOutput{
-				Kind:      grant.Binding.Kind,
-				Name:      grant.Binding.Name,
-				Namespace: grant.Binding.Namespace,
-			},
-			Role: RoleOutput{
-				Kind:      grant.Role.Kind,
-				Name:      grant.Role.Name,
-				Namespace: grant.Role.Namespace,
-			},
-			MatchingRule: RuleOutput{
-				Verbs:         grant.MatchingRule.Verbs,
-				APIGroups:     grant.MatchingRule.APIGroups,
-				Resources:     grant.MatchingRule.Resources,
-				ResourceNames: grant.MatchingRule.ResourceNames,
-			},
-			Scope: string(grant.Scope),
-		}
-		output.Grants = append(output.Grants, grantOutput)
-	}
-
-	for _, err := range result.Errors {
-		output.Errors = append(output.Errors, err.Error())
-	}
-
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(output)
+	return encoder.Encode(buildStructuredOutput(result, ctx))
 }
 
-// YAMLPrinter outputs YAML format
+// YAMLPrinter outputs YAML format. It marshals via sigs.k8s.io/yaml so the
+// json struct tags (field names and omitempty) apply to YAML exactly as
+// documented for the JSON schema.
 type YAMLPrinter struct{}
 
 func (p *YAMLPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *ContextInfo) error {
-	output := JSONOutput{
-		Allowed: result.Allowed,
-		Subject: SubjectOutput{
-			Kind:      result.Subject.Kind,
-			Name:      result.Subject.Name,
-			Namespace: result.Subject.Namespace,
-		},
-		Request: RequestOutput{
-			Verb:         result.Request.Verb,
-			APIGroup:     result.Request.APIGroup,
-			Resource:     result.Request.Resource,
-			Subresource:  result.Request.Subresource,
-			ResourceName: result.Request.ResourceName,
-			Namespace:    result.Request.Namespace,
-		},
-		Grants: make([]GrantOutput, 0, len(result.Grants)),
+	data, err := yaml.Marshal(buildStructuredOutput(result, ctx))
+	if err != nil {
+		return err
 	}
-
-	// Include context info if --as was not provided
-	if ctx != nil {
-		output.Context = contextOutputFromInfo(ctx)
-	}
-
-	for _, grant := range result.Grants {
-		grantOutput := GrantOutput{
-			Binding: BindingOutput{
-				Kind:      grant.Binding.Kind,
-				Name:      grant.Binding.Name,
-				Namespace: grant.Binding.Namespace,
-			},
-			Role: RoleOutput{
-				Kind:      grant.Role.Kind,
-				Name:      grant.Role.Name,
-				Namespace: grant.Role.Namespace,
-			},
-			MatchingRule: RuleOutput{
-				Verbs:         grant.MatchingRule.Verbs,
-				APIGroups:     grant.MatchingRule.APIGroups,
-				Resources:     grant.MatchingRule.Resources,
-				ResourceNames: grant.MatchingRule.ResourceNames,
-			},
-			Scope: string(grant.Scope),
-		}
-		output.Grants = append(output.Grants, grantOutput)
-	}
-
-	for _, err := range result.Errors {
-		output.Errors = append(output.Errors, err.Error())
-	}
-
-	encoder := yaml.NewEncoder(w)
-	encoder.SetIndent(2)
-	return encoder.Encode(output)
+	_, err = w.Write(data)
+	return err
 }

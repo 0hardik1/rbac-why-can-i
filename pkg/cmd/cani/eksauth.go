@@ -85,6 +85,10 @@ func ResolveAccessEntryIdentity(ctx context.Context, client EKSAPI, clusterName,
 		return &AccessEntryIdentity{Found: false}, nil
 	}
 
+	// Access entries are keyed by IAM principal ARN; callers coming through
+	// STS present an assumed-role ARN, so normalize it back to the role ARN.
+	principalARN = assumedRoleARNToRoleARN(principalARN)
+
 	out, err := client.DescribeAccessEntry(ctx, &eks.DescribeAccessEntryInput{
 		ClusterName:  aws.String(clusterName),
 		PrincipalArn: aws.String(principalARN),

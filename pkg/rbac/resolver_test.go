@@ -44,6 +44,38 @@ func TestParseSubject(t *testing.T) {
 			},
 		},
 		{
+			name:  "per-namespace serviceaccounts group",
+			input: "system:serviceaccounts:kube-system",
+			expected: Subject{
+				Kind: "Group",
+				Name: "system:serviceaccounts:kube-system",
+			},
+		},
+		{
+			name:  "system component is a user",
+			input: "system:kube-scheduler",
+			expected: Subject{
+				Kind: "User",
+				Name: "system:kube-scheduler",
+			},
+		},
+		{
+			name:  "anonymous is a user",
+			input: "system:anonymous",
+			expected: Subject{
+				Kind: "User",
+				Name: "system:anonymous",
+			},
+		},
+		{
+			name:  "node identity is a user",
+			input: "system:node:ip-10-0-0-1.ec2.internal",
+			expected: Subject{
+				Kind: "User",
+				Name: "system:node:ip-10-0-0-1.ec2.internal",
+			},
+		},
+		{
 			name:  "user",
 			input: "jane",
 			expected: Subject{

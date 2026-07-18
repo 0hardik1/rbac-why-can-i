@@ -39,8 +39,10 @@ func ParseSubject(asString string) (Subject, error) {
 		}, nil
 	}
 
-	// Groups typically start with "system:" but aren't serviceaccounts
-	if strings.HasPrefix(asString, "system:") {
+	// Only the well-known system groups are groups. Other system:* names
+	// (system:kube-scheduler, system:anonymous, system:node:<name>, ...) are
+	// users.
+	if isSystemGroup(asString) {
 		return Subject{
 			Kind: "Group",
 			Name: asString,
@@ -52,6 +54,37 @@ func ParseSubject(asString string) (Subject, error) {
 		Kind: "User",
 		Name: asString,
 	}, nil
+}
+
+// systemGroups are the well-known system:* names Kubernetes defines as
+// groups. Everything else under system:* (system:kube-scheduler,
+// system:kube-proxy, system:anonymous, system:apiserver, system:node:<name>,
+// ...) is a user.
+var systemGroups = map[string]bool{
+	"system:masters":         true,
+	"system:authenticated":   true,
+	"system:unauthenticated": true,
+	"system:serviceaccounts": true,
+	"system:nodes":           true,
+	"system:bootstrappers":   true,
+	"system:monitoring":      true,
+}
+
+var systemGroupPrefixes = []string{
+	"system:serviceaccounts:", // per-namespace ServiceAccount groups
+	"system:bootstrappers:",   // bootstrap token groups
+}
+
+func isSystemGroup(name string) bool {
+	if systemGroups[name] {
+		return true
+	}
+	for _, prefix := range systemGroupPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolvePermission finds all grants for a permission request
@@ -177,15 +210,19 @@ func (r *Resolver) bindingMatchesSubject(subjects []rbacv1.Subject, subject Subj
 	return false
 }
 
-// ResolveAllPermissions gets all permissions for a subject (for risky permission analysis)
-func (r *Resolver) ResolveAllPermissions(ctx context.Context, subject Subject, namespace string) ([]PermissionGrant, error) {
+// ResolveAllPermissions gets all permissions for a subject (for risky
+// permission analysis). The returned []error lists RBAC objects that could
+// not be fetched; when non-empty the grant list may be incomplete and callers
+// must not present the result as exhaustive.
+func (r *Resolver) ResolveAllPermissions(ctx context.Context, subject Subject, namespace string) ([]PermissionGrant, []error, error) {
 	var grants []PermissionGrant
+	var resolveErrs []error
 	groups := GetImplicitGroups(subject)
 
 	// Get all ClusterRoleBindings
 	crbs, err := r.client.ListClusterRoleBindings(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list cluster role bindings: %w", err)
+		return nil, nil, fmt.Errorf("failed to list cluster role bindings: %w", err)
 	}
 
 	for _, crb := range crbs.Items {
@@ -195,6 +232,7 @@ func (r *Resolver) ResolveAllPermissions(ctx context.Context, subject Subject, n
 
 		clusterRole, err := r.client.GetClusterRole(ctx, crb.RoleRef.Name)
 		if err != nil {
+			resolveErrs = append(resolveErrs, fmt.Errorf("failed to get cluster role %s: %w", crb.RoleRef.Name, err))
 			continue
 		}
 
@@ -219,7 +257,7 @@ func (r *Resolver) ResolveAllPermissions(ctx context.Context, subject Subject, n
 	if namespace != "" {
 		rbs, err := r.client.ListRoleBindings(ctx, namespace)
 		if err != nil {
-			return nil, fmt.Errorf("failed to list role bindings: %w", err)
+			return nil, nil, fmt.Errorf("failed to list role bindings: %w", err)
 		}
 
 		for _, rb := range rbs.Items {
@@ -233,6 +271,7 @@ func (r *Resolver) ResolveAllPermissions(ctx context.Context, subject Subject, n
 			if rb.RoleRef.Kind == "ClusterRole" {
 				clusterRole, err := r.client.GetClusterRole(ctx, rb.RoleRef.Name)
 				if err != nil {
+					resolveErrs = append(resolveErrs, fmt.Errorf("failed to get cluster role %s: %w", rb.RoleRef.Name, err))
 					continue
 				}
 				rules = clusterRole.Rules
@@ -240,6 +279,7 @@ func (r *Resolver) ResolveAllPermissions(ctx context.Context, subject Subject, n
 			} else {
 				role, err := r.client.GetRole(ctx, namespace, rb.RoleRef.Name)
 				if err != nil {
+					resolveErrs = append(resolveErrs, fmt.Errorf("failed to get role %s in namespace %s: %w", rb.RoleRef.Name, namespace, err))
 					continue
 				}
 				rules = role.Rules
@@ -262,5 +302,5 @@ func (r *Resolver) ResolveAllPermissions(ctx context.Context, subject Subject, n
 		}
 	}
 
-	return grants, nil
+	return grants, resolveErrs, nil
 }

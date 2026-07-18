@@ -81,6 +81,13 @@ type PermissionResult struct {
 	Errors  []error
 }
 
+// Incomplete reports whether some RBAC objects could not be read during
+// resolution. When true, Grants may be missing paths and Allowed=false must
+// not be presented as a definitive denial.
+func (r *PermissionResult) Incomplete() bool {
+	return len(r.Errors) > 0
+}
+
 // RiskyPermission identifies a potentially dangerous permission
 type RiskyPermission struct {
 	Category    string // e.g., "secrets", "privilege-escalation", "node-access"

@@ -141,7 +141,7 @@ e2e: ## Complete e2e workflow: create kind cluster, setup, test, and cleanup
 	@$(MAKE) kind-setup-rbac
 	@echo ""
 	@echo "Step 4/5: Running e2e tests..."
-	@RBAC_WHY_BINARY=./bin/$(BINARY_NAME) go test -v -timeout 30m ./test/e2e/...
+	@RBAC_WHY_BINARY=$(CURDIR)/bin/$(BINARY_NAME) go test -v -timeout 30m ./test/e2e/...
 	@echo ""
 	@echo "Step 5/5: E2E tests completed successfully!"
 	@echo ""

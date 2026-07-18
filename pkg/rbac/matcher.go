@@ -1,6 +1,8 @@
 package rbac
 
 import (
+	"strings"
+
 	rbacv1 "k8s.io/api/rbac/v1"
 )
 
@@ -21,16 +23,17 @@ func RuleMatches(rule rbacv1.PolicyRule, request PermissionRequest) bool {
 		return false
 	}
 
-	// Check resource name match (if specified in rule)
-	if len(rule.ResourceNames) > 0 && request.ResourceName != "" {
+	// A rule restricted to named objects only grants access to those objects.
+	// A request without a name asks about the resource in general (e.g. a
+	// list, or a get across all names), which such a rule does not allow.
+	if len(rule.ResourceNames) > 0 {
+		if request.ResourceName == "" {
+			return false
+		}
 		if !matchesResourceName(rule.ResourceNames, request.ResourceName) {
 			return false
 		}
 	}
-
-	// If rule has resourceNames but request doesn't specify one,
-	// the rule still applies (it grants access to specific resources)
-	// For a "can-i" check without resource name, we assume it could match
 
 	return true
 }
@@ -55,7 +58,12 @@ func matchesAPIGroup(ruleGroups []string, requestGroup string) bool {
 	return false
 }
 
-// matchesResource checks if the requested resource (with subresource) matches any of the rule resources
+// matchesResource checks if the requested resource (with subresource) matches
+// any of the rule resources. Mirrors the upstream RBAC evaluator: "*" matches
+// everything, an exact "resource/subresource" string matches, and the special
+// "*/subresource" form matches that subresource on any resource. Forms like
+// "pods/*" are NOT wildcards in Kubernetes and only match a literal
+// subresource named "*".
 func matchesResource(ruleResources []string, requestResource, requestSubresource string) bool {
 	// Build the full resource string (e.g., "pods" or "pods/exec")
 	fullResource := requestResource
@@ -69,20 +77,16 @@ func matchesResource(ruleResources []string, requestResource, requestSubresource
 			return true
 		}
 
-		// Exact match
+		// Exact match ("pods", or "pods/exec" against a subresource request)
 		if r == fullResource {
 			return true
 		}
 
-		// Handle wildcard subresource: "pods/*" matches "pods/log", "pods/exec", etc.
-		if requestSubresource != "" {
-			if r == requestResource+"/*" {
-				return true
-			}
-		}
-
-		// If request has no subresource but rule is for base resource
-		if requestSubresource == "" && r == requestResource {
+		// "*/subresource" matches the subresource on any resource
+		if requestSubresource != "" &&
+			len(r) == len(requestSubresource)+2 &&
+			strings.HasPrefix(r, "*/") &&
+			strings.HasSuffix(r, requestSubresource) {
 			return true
 		}
 	}
@@ -145,14 +149,24 @@ func GetImplicitGroups(subject Subject) []string {
 	groups := make([]string, 0, len(subject.Groups)+3)
 	groups = append(groups, subject.Groups...)
 
-	// Add implicit groups
-	groups = append(groups, "system:authenticated")
-
-	if subject.Kind == "ServiceAccount" {
+	switch subject.Kind {
+	case "ServiceAccount":
 		groups = append(groups,
+			"system:authenticated",
 			"system:serviceaccounts",
 			"system:serviceaccounts:"+subject.Namespace,
 		)
+	case "User":
+		// system:anonymous is the only unauthenticated user; it belongs to
+		// system:unauthenticated, never system:authenticated.
+		if subject.Name == "system:anonymous" {
+			groups = append(groups, "system:unauthenticated")
+		} else {
+			groups = append(groups, "system:authenticated")
+		}
+	case "Group":
+		// A group subject has no implicit memberships of its own; the group
+		// name itself is matched directly against binding subjects.
 	}
 
 	return groups

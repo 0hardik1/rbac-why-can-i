@@ -24,26 +24,46 @@ func matchesAssumedRole(roleArn, assumedRoleArn string) bool {
 	if len(arnParts) < 5 {
 		return false
 	}
+	partition := arnParts[1]
 	account := arnParts[4]
 
-	expectedPrefix := fmt.Sprintf("arn:aws:sts::%s:assumed-role/%s", account, roleName)
+	expectedPrefix := fmt.Sprintf("arn:%s:sts::%s:assumed-role/%s", partition, account, roleName)
 	return assumedRoleArn == expectedPrefix ||
 		strings.HasPrefix(assumedRoleArn, expectedPrefix+"/")
 }
 
-// convertRoleToAssumedRoleArn returns the assumed-role ARN prefix for a given
-// IAM role ARN. The session-name suffix is omitted because the caller doesn't
-// know which session will be used; consumers compare with HasPrefix.
+// convertRoleToAssumedRoleArn returns the assumed-role ARN for a given IAM
+// role ARN. Partition and account are taken from the role ARN itself so
+// cross-account and non-standard-partition roles synthesize correctly;
+// fallbackAccount is only used when the role ARN doesn't carry an account.
+// sessionName is appended when known ("" omits it; consumers compare with
+// HasPrefix).
 //
-//	in:  arn:aws:iam::ACCOUNT:role/[PATH/]ROLE-NAME
-//	out: arn:aws:sts::ACCOUNT:assumed-role/ROLE-NAME
-func convertRoleToAssumedRoleArn(roleArn, accountID string) string {
-	parts := strings.Split(roleArn, "/")
-	if len(parts) < 2 {
+//	in:  arn:PARTITION:iam::ACCOUNT:role/[PATH/]ROLE-NAME
+//	out: arn:PARTITION:sts::ACCOUNT:assumed-role/ROLE-NAME[/SESSION-NAME]
+func convertRoleToAssumedRoleArn(roleArn, fallbackAccount, sessionName string) string {
+	slashParts := strings.Split(roleArn, "/")
+	if len(slashParts) < 2 {
 		return roleArn
 	}
-	roleName := parts[len(parts)-1]
-	return fmt.Sprintf("arn:aws:sts::%s:assumed-role/%s", accountID, roleName)
+	roleName := slashParts[len(slashParts)-1]
+
+	partition := "aws"
+	account := fallbackAccount
+	if colonParts := strings.Split(roleArn, ":"); len(colonParts) >= 5 {
+		if colonParts[1] != "" {
+			partition = colonParts[1]
+		}
+		if colonParts[4] != "" {
+			account = colonParts[4]
+		}
+	}
+
+	arn := fmt.Sprintf("arn:%s:sts::%s:assumed-role/%s", partition, account, roleName)
+	if sessionName != "" {
+		arn += "/" + sessionName
+	}
+	return arn
 }
 
 // assumedRoleARNToRoleARN converts an STS assumed-role ARN back to the IAM
@@ -62,6 +82,7 @@ func assumedRoleARNToRoleARN(arn string) string {
 	if len(parts) < 6 {
 		return arn
 	}
+	partition := parts[1]
 	account := parts[4]
 	// parts[5] is "assumed-role/ROLE-NAME[/SESSION-NAME]"
 	tail := strings.TrimPrefix(parts[5], "assumed-role/")
@@ -71,5 +92,5 @@ func assumedRoleARNToRoleARN(arn string) string {
 	if tail == "" {
 		return arn
 	}
-	return fmt.Sprintf("arn:aws:iam::%s:role/%s", account, tail)
+	return fmt.Sprintf("arn:%s:iam::%s:role/%s", partition, account, tail)
 }

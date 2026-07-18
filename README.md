@@ -153,11 +153,13 @@ make install    # copy to $GOBIN
 
 ```bash
 # Using current kubeconfig context (recommended for checking your own permissions)
-kubectl rbac-why can-i <verb> <resource> [-n namespace]
+kubectl rbac-why can-i <verb> <resource> [name] [-n namespace]
 
 # Check permissions for a specific subject
-kubectl rbac-why can-i --as <subject> <verb> <resource> [-n namespace]
+kubectl rbac-why can-i --as <subject> [--as-group <group>] <verb> <resource> [name] [-n namespace]
 ```
+
+Namespace resolution follows kubectl: the `-n` flag wins, then the kubeconfig context's namespace, then `default`. For cluster-scoped resources (nodes, persistentvolumes, ...) the namespace is ignored; the tool checks the resource's scope and API group via API discovery, so `get deployments` resolves to the `apps` group without spelling out `deployments.apps`.
 
 ### Check Your Own Permissions
 
@@ -181,6 +183,23 @@ kubectl rbac-why can-i --as system:serviceaccount:kube-system:admin list nodes
 ```bash
 kubectl rbac-why can-i create pods/exec -n default
 kubectl rbac-why can-i --as system:serviceaccount:default:debug-sa create pods/exec -n default
+
+# kubectl-style flag form is also accepted
+kubectl rbac-why can-i get pods --subresource=log -n default
+```
+
+Note: unlike `kubectl auth can-i`, the slash form here means RESOURCE/SUBRESOURCE, not RESOURCE/NAME. Pass the resource name as a separate argument (below).
+
+### Check Access to a Named Object (resourceNames)
+
+RBAC rules with `resourceNames` only grant access to those specific objects. A request without a name asks about the resource in general and is NOT satisfied by such rules:
+
+```bash
+# Denied if the only rule is restricted to resourceNames: ["db-password"]
+kubectl rbac-why can-i --as jane get secrets -n default
+
+# Allowed: the named request matches the resourceNames rule
+kubectl rbac-why can-i --as jane get secrets db-password -n default
 ```
 
 ### Output Formats
@@ -236,8 +255,10 @@ This detects risky permissions such as:
 - Pod creation (privilege escalation vector)
 - Impersonation
 - Node proxy access
-- Role/binding modification
+- Role/binding modification (including the `escalate` and `bind` verbs)
 - Wildcard permissions (cluster-admin equivalent)
+
+On EKS, permissions granted through EKS access policies attached to the caller's Access Entry are included in the analysis. If some RBAC objects cannot be read, the report is labeled incomplete instead of claiming a clean result.
 
 ## Development
 
@@ -330,23 +351,27 @@ The `--as` flag is parsed to determine the subject type:
 | Input Format | Subject Type | Example |
 |--------------|--------------|---------|
 | `system:serviceaccount:<ns>:<name>` | ServiceAccount | `system:serviceaccount:default:my-sa` |
-| `system:*` (other patterns) | Group | `system:masters` |
-| Everything else | User | `jane@example.com` |
+| Well-known system groups (`system:masters`, `system:authenticated`, `system:unauthenticated`, `system:serviceaccounts`, `system:serviceaccounts:<ns>`, `system:nodes`, `system:bootstrappers[:...]`, `system:monitoring`) | Group | `system:masters` |
+| Everything else, including other `system:*` identities | User | `jane@example.com`, `system:kube-scheduler`, `system:anonymous`, `system:node:<name>` |
+
+When `--as` is not given and the kubeconfig uses token, exec, or OIDC authentication, the tool asks the API server for the authenticated username and groups via a `SelfSubjectReview` instead of guessing from the kubeconfig entry name.
 
 ### Step 2: Compute Implicit Group Memberships
 
 Before searching for bindings, the tool computes all groups the subject implicitly belongs to:
 
-- **All authenticated subjects**: `system:authenticated`
+- **Authenticated users and ServiceAccounts**: `system:authenticated`
+- **The `system:anonymous` user**: `system:unauthenticated` (never `system:authenticated`)
 - **All ServiceAccounts**: `system:serviceaccounts`
 - **ServiceAccounts in a namespace**: `system:serviceaccounts:<namespace>`
+- **Group subjects**: no implicit memberships; the group name itself is matched against binding subjects
 
 For example, `system:serviceaccount:default:my-sa` belongs to:
 - `system:authenticated`
 - `system:serviceaccounts`
 - `system:serviceaccounts:default`
 
-This is critical because bindings that target these groups will also grant permissions to the subject.
+This is critical because bindings that target these groups will also grant permissions to the subject. Explicit groups (client-certificate `O` fields, `--as-group`, aws-auth or Access Entry groups) are merged in as well.
 
 ### Step 3: Search ClusterRoleBindings
 
@@ -361,7 +386,7 @@ If the binding matches, the tool fetches the referenced **ClusterRole** and proc
 
 ### Step 4: Search RoleBindings (Namespace-Scoped)
 
-If a namespace is specified in the request, the tool also lists **RoleBindings in that namespace**:
+For namespaced requests (the effective namespace is the `-n` flag, else the kubeconfig context namespace, else `default`), the tool also lists **RoleBindings in that namespace**:
 
 1. Same subject matching logic as ClusterRoleBindings
 2. RoleBindings can reference either:
@@ -378,16 +403,18 @@ For each Role/ClusterRole found through matching bindings, the tool examines eve
 rule matches if ALL of the following are true:
 ├── Verb matches (rule.verbs contains request.verb OR "*")
 ├── API Group matches (rule.apiGroups contains request.apiGroup OR "*")
-├── Resource matches (rule.resources contains request.resource OR "*")
-│   └── Handles subresources: "pods/exec" matches "pods/exec", "pods/*", or "*"
-└── ResourceName matches (if rule.resourceNames is set and request specifies a name)
+├── Resource matches (rule.resources contains request.resource, "*", or "*/subresource")
+│   └── Subresources: "pods/exec" matches "pods/exec", "*/exec", or "*"
+└── ResourceNames: a rule with resourceNames only matches when the request
+    names one of those objects; a request without a name is not satisfied
 ```
 
-**Wildcard handling**:
+**Wildcard handling** (mirrors the upstream Kubernetes RBAC evaluator):
 - `*` in verbs matches any verb
 - `*` in apiGroups matches any API group
-- `*` in resources matches any resource
-- `pods/*` matches any subresource of pods
+- `*` in resources matches any resource and subresource
+- `*/scale` matches the `scale` subresource on any resource
+- `pods/*` is NOT a wildcard in Kubernetes and is not treated as one
 
 ### Step 6: Build Grant Chains
 

@@ -43,8 +43,11 @@ Layered, with a clear unidirectional dependency: `cmd → pkg/cmd/cani → {pkg/
 - **`cmd/kubectl-rbac_why/main.go`** — thin entrypoint; wires `genericclioptions.IOStreams` and delegates to `cani.NewCmdRbacWhy`.
 - **`pkg/cmd/cani/`** — Cobra command, option parsing, subject resolution from kubeconfig.
   - `cani.go` builds the command and orchestrates the flow in `Run`.
-  - `options.go` parses flags, completes subject from current context (cert CN/O, token, exec, auth-provider), and parses `VERB RESOURCE` strings including subresources (`pods/exec`) and dotted API groups (`deployments.apps`).
-  - `awsauth.go` reads the `kube-system/aws-auth` ConfigMap to map an IAM ARN → Kubernetes username/groups for EKS.
+  - `options.go` parses flags, completes subject from current context (cert CN/O, token, exec, auth-provider), and parses `VERB RESOURCE [NAME]` including subresources (`pods/exec` or `--subresource`) and dotted API groups (`deployments.apps`). Note: unlike kubectl, the slash form means subresource; the resource name is the third positional arg.
+  - `discovery.go` aligns the request with the cluster via API discovery: fills in the API group when omitted and clears the namespace for cluster-scoped resources. Degrades to a warning if discovery fails.
+  - `selfsubject.go` resolves the authenticated identity via `SelfSubjectReview` when the kubeconfig can't (token/exec/OIDC auth); used whenever `ContextInfo.IdentityResolved` is false.
+  - `awsauth.go` reads the `kube-system/aws-auth` ConfigMap to map an IAM ARN → Kubernetes username/groups for EKS. Malformed mapRoles/mapUsers YAML is an error, not a silent miss.
+  - `ekspolicy.go` maps EKS access policies (AmazonEKSClusterAdminPolicy → cluster-admin rules, AmazonEKS{Admin,Edit,View}Policy → the matching ClusterRole fetched from the cluster, AmazonEKSAdminViewPolicy → read-all) into `PermissionGrant`s so access-policy-only admins aren't reported as denied. Unknown policies produce an error entry (incomplete result), never silence.
 - **`pkg/client/`** — abstraction over the Kubernetes API (`RBACClient` interface). `K8sRBACClient` is the real impl; `MockRBACClient` is used by `pkg/rbac` unit tests. Only six methods: list/get for Roles, ClusterRoles, RoleBindings, ClusterRoleBindings.
 - **`pkg/rbac/`** — pure RBAC logic, no I/O beyond the `RBACClient` interface.
   - `types.go`: `PermissionRequest`, `Subject`, `PermissionGrant`, `PermissionResult`, `RiskyPermission`.
@@ -54,30 +57,30 @@ Layered, with a clear unidirectional dependency: `cmd → pkg/cmd/cani → {pkg/
 
 ### Resolution algorithm (key invariants)
 
-1. `ParseSubject` splits on prefix: `system:serviceaccount:NS:NAME` → ServiceAccount; other `system:*` → Group; everything else → User.
-2. `GetImplicitGroups` always adds `system:authenticated`; ServiceAccounts also get `system:serviceaccounts` and `system:serviceaccounts:<ns>`. Explicit groups (e.g. cert `O` fields, aws-auth `groups`) are merged in. **Group binding matches must consult this list, not just `subject.Groups` directly.**
-3. `Resolver.ResolvePermission` always scans every `ClusterRoleBinding` (cluster-wide grants apply regardless of namespace), then — only if `request.Namespace != ""` — also scans `RoleBindings` in that namespace. A `RoleBinding` with `RoleRef.Kind == "ClusterRole"` references the ClusterRole's rules but produces a namespace-scoped grant (`ScopeNamespace`).
-4. `RuleMatches` checks verb, API group, resource (with subresource handling), and resourceName independently. `*` is the wildcard for all three of verbs/apiGroups/resources. Resource matching also handles `pods/*` patterns. If a rule has `ResourceNames` but the request omits a resource name, the rule is treated as matching (a "could match" check).
-5. The result returns **every** matching grant chain — duplicates across paths are intentional. Don't dedupe.
+1. `ParseSubject` splits on prefix: `system:serviceaccount:NS:NAME` → ServiceAccount; the well-known system groups (`system:masters`, `system:authenticated`, `system:unauthenticated`, `system:serviceaccounts[:<ns>]`, `system:nodes`, `system:bootstrappers[:...]`, `system:monitoring`) → Group; everything else, **including other `system:*` names** (`system:kube-scheduler`, `system:anonymous`, `system:node:<name>`) → User.
+2. `GetImplicitGroups`: User/ServiceAccount subjects get `system:authenticated`, except the user `system:anonymous` which gets `system:unauthenticated`. ServiceAccounts also get `system:serviceaccounts` and `system:serviceaccounts:<ns>`. Group subjects get no implicit memberships. Explicit groups (cert `O` fields, `--as-group`, aws-auth/Access Entry groups) are merged in. **Group binding matches must consult this list, not just `subject.Groups` directly.**
+3. The effective namespace mirrors kubectl: `-n` flag, else kubeconfig context namespace, else `default`; `applyDiscovery` then clears it for cluster-scoped resources and resolves the API group when omitted. `Resolver.ResolvePermission` always scans every `ClusterRoleBinding` (cluster-wide grants apply regardless of namespace), then (only if `request.Namespace != ""`) also scans `RoleBindings` in that namespace. A `RoleBinding` with `RoleRef.Kind == "ClusterRole"` references the ClusterRole's rules but produces a namespace-scoped grant (`ScopeNamespace`).
+4. `RuleMatches` mirrors the upstream Kubernetes evaluator. `*` is the wildcard for verbs/apiGroups/resources; `*/subresource` matches that subresource on any resource; `pods/*` is NOT a wildcard. A rule with `ResourceNames` only matches when the request names one of those objects; a nameless request is NOT satisfied by it.
+5. The result returns **every** matching grant chain; duplicates across paths are intentional. Don't dedupe. EKS access policy grants (Binding.Kind `EKSAccessEntry`, Role.Kind `EKSAccessPolicy`) are appended in `Run` after RBAC resolution.
+6. `result.Errors` (unreadable Roles/ClusterRoles, unrecognized access policies) makes the result **incomplete**: text/dot/mermaid output must render INCOMPLETE instead of DENIED, JSON/YAML set `incomplete: true`, and `--show-risky` must not claim a clean result. Never present an incomplete resolution as a definitive denial.
 
 ### Subject resolution from current context
 
 When `--as` is omitted, `completeFromCurrentContext` extracts the user identity from kubeconfig:
 
-- **Client certificate** (inline data or file path): parsed with `crypto/x509`; CN → username, O fields → groups.
-- **Token / TokenFile**: cannot resolve identity locally, falls back to the kubeconfig `authInfo` name.
-- **Exec auth**: detected as AWS (aws-iam-authenticator or `aws eks get-token`) or generic. For AWS, runs `aws sts get-caller-identity` (honoring `--profile`, exec args `-r/--role/--role-arn`, and exec env). If the exec config assumes a role, the username becomes `arn:aws:sts::ACCOUNT:assumed-role/ROLE-NAME` (no session suffix — used as the lookup key against `aws-auth`).
-- **Auth provider** (oidc, gcp): cannot resolve, falls back to authInfo name.
+- **Client certificate** (inline data or file path): parsed with `crypto/x509`; CN → username, O fields → groups. Marked resolved.
+- **Token / TokenFile / generic exec / auth provider (oidc, gcp)**: cannot resolve locally; `IdentityResolved` stays false and `Run` asks the API server via `SelfSubjectReview` (falling back to the authInfo name with a warning if that call fails).
+- **AWS exec auth** (aws-iam-authenticator or `aws eks get-token`): runs `aws sts get-caller-identity` (honoring `--profile`, exec args `-r/--role/--role-arn`, and exec env). If the exec config assumes a role, the username becomes the assumed-role ARN synthesized from the **role ARN's own partition and account** (cross-account safe), with session name `EKSGetTokenAuth` appended for `aws eks get-token` (other tools: no session suffix; aws-auth matching uses prefix comparison).
 
-For AWS IAM auth, after building the REST config, `Run` calls `ResolveAWSAuthIdentity` to map the IAM ARN through the `kube-system/aws-auth` ConfigMap (`mapRoles`/`mapUsers`) and rewrites `o.As` and `subject.Groups` to the mapped identity. If aws-auth isn't readable, it logs a warning and proceeds with the IAM ARN.
+For AWS IAM auth, `Run` walks Access Entry → aws-auth → raw ARN (`orchestrateAWSIdentity`). Pod Identity associations are informational only and never rewrite the identity. `--profile` is also injected into the kubeconfig's AWS exec plugin (`injectAWSProfile`) so the cluster client and the identity lookups use the same AWS principal. Access policies from a found Access Entry are carried in `ContextInfo.AccessPolicies` and folded into results via `accessPolicyGrants`.
 
 ### Important: impersonation handling
 
-`cani.Run` **deliberately clears** `ConfigFlags.Impersonate*` before building the REST config and restores them afterward. The Kubernetes client used to *read* RBAC objects must use the caller's real credentials, not impersonate the subject being investigated — otherwise the tool would be limited to whatever the subject itself can see. Don't "fix" this by removing the save/restore.
+`cani.Run` **deliberately clears** `restConfig.Impersonate` right after `ToRESTConfig()`. The Kubernetes client used to *read* RBAC objects must use the caller's real credentials, not impersonate the subject being investigated; otherwise the tool would be limited to whatever the subject itself can see. Don't "fix" this by removing the clear. (It must be done on the built `rest.Config`, not by mutating `ConfigFlags` first: the flags' kubeconfig loader is cached with the original impersonation overrides.)
 
 ### Output formats
 
-`text` (default, ASCII grant chains), `json`, `yaml`, `dot` (GraphViz, pipe through `dot -Tpng`), `mermaid`. The `Printer` interface receives an optional `*ContextInfo` that's only populated when `--as` is not provided (so output can show which kubeconfig context was used).
+`text` (default, ASCII grant chains), `json`, `yaml`, `dot` (GraphViz, pipe through `dot -Tpng`), `mermaid`. The `Printer` interface receives an optional `*ContextInfo` that's only populated when `--as` is not provided (so output can show which kubeconfig context was used). YAML output goes through `sigs.k8s.io/yaml` so the json struct tags (names + omitempty) define the schema for both JSON and YAML; don't switch it back to a tag-unaware YAML encoder. Risky-pattern matching in `pkg/output/risky.go` only widens on **rule-side** wildcards; pattern values are literal targets (the cluster-admin pattern's `*` matches only rules that literally grant `*`).
 
 ## Conventions
 
