@@ -8,11 +8,9 @@ import (
 
 // RuleMatches reports whether a PolicyRule grants the requested permission.
 //
-// Verb, API group, resource, and non-resource-URL matching mirror the upstream
-// Kubernetes RBAC authorizer so that answers agree with what the live cluster
-// would decide. ResourceNames is treated as a "could match" check: a rule
-// scoped to specific names still matches a request that omits a resource name
-// (see the comment on that branch).
+// Verb, API group, resource, resource-name, and non-resource-URL matching
+// mirror the upstream Kubernetes RBAC authorizer so that answers agree with
+// what the live cluster would decide.
 func RuleMatches(rule rbacv1.PolicyRule, request PermissionRequest) bool {
 	// Non-resource URL request (e.g. /healthz, /metrics). Only the verb and
 	// the URL are relevant; API group and resource don't apply, and such
@@ -37,11 +35,13 @@ func RuleMatches(rule rbacv1.PolicyRule, request PermissionRequest) bool {
 		return false
 	}
 
-	// ResourceNames restricts a rule to specific named objects. Only reject
-	// when the request names a specific object that the rule's list excludes.
-	// When the request omits a name (a "can-i"-style check), a name-scoped
-	// rule is reported as a possible match rather than excluded.
-	if len(rule.ResourceNames) > 0 && request.ResourceName != "" {
+	// A rule restricted to named objects only grants access to those objects.
+	// A request without a name asks about the resource in general (e.g. a
+	// list, or a get across all names), which such a rule does not allow.
+	if len(rule.ResourceNames) > 0 {
+		if request.ResourceName == "" {
+			return false
+		}
 		if !matchesResourceName(rule.ResourceNames, request.ResourceName) {
 			return false
 		}
@@ -185,14 +185,24 @@ func GetImplicitGroups(subject Subject) []string {
 	groups := make([]string, 0, len(subject.Groups)+3)
 	groups = append(groups, subject.Groups...)
 
-	// Add implicit groups
-	groups = append(groups, "system:authenticated")
-
-	if subject.Kind == "ServiceAccount" {
+	switch subject.Kind {
+	case "ServiceAccount":
 		groups = append(groups,
+			"system:authenticated",
 			"system:serviceaccounts",
 			"system:serviceaccounts:"+subject.Namespace,
 		)
+	case "User":
+		// system:anonymous is the only unauthenticated user; it belongs to
+		// system:unauthenticated, never system:authenticated.
+		if subject.Name == "system:anonymous" {
+			groups = append(groups, "system:unauthenticated")
+		} else {
+			groups = append(groups, "system:authenticated")
+		}
+	case "Group":
+		// A group subject has no implicit memberships of its own; the group
+		// name itself is matched directly against binding subjects.
 	}
 
 	return groups

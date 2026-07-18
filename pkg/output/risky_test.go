@@ -1,6 +1,9 @@
 package output
 
 import (
+	"bytes"
+	"errors"
+	"strings"
 	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -74,6 +77,16 @@ func TestMatchesRiskyPattern(t *testing.T) {
 			want:     true,
 		},
 		{
+			name: "star-slash exec rule IS pod-exec",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"create"},
+				APIGroups: []string{""},
+				Resources: []string{"*/exec"},
+			},
+			category: "pod-exec",
+			want:     true,
+		},
+		{
 			name: "create configmaps is NOT pod-exec",
 			rule: rbacv1.PolicyRule{
 				Verbs:     []string{"create"},
@@ -112,6 +125,38 @@ func TestMatchesRiskyPattern(t *testing.T) {
 			},
 			category: "cluster-admin",
 			want:     false,
+		},
+		{
+			// Wildcard verbs on a narrow resource are risky for that resource,
+			// but not cluster-admin.
+			name: "wildcard verbs on pods only is NOT cluster-admin",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"*"},
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+			},
+			category: "cluster-admin",
+			want:     false,
+		},
+		{
+			name: "escalate verb on clusterroles IS role-escalation",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"escalate"},
+				APIGroups: []string{"rbac.authorization.k8s.io"},
+				Resources: []string{"clusterroles"},
+			},
+			category: "role-escalation",
+			want:     true,
+		},
+		{
+			name: "bind verb on rolebindings IS binding-escalation",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"bind"},
+				APIGroups: []string{"rbac.authorization.k8s.io"},
+				Resources: []string{"rolebindings"},
+			},
+			category: "binding-escalation",
+			want:     true,
 		},
 	}
 
@@ -188,4 +233,44 @@ func TestAnalyzeRiskyPermissions(t *testing.T) {
 			t.Errorf("expected cluster-admin for wildcard grant, got %v", cats)
 		}
 	})
+
+	t.Run("wildcard verbs on pods trips pod-create but not cluster-admin", func(t *testing.T) {
+		grants := []rbac.PermissionGrant{
+			grantWith(rbacv1.PolicyRule{
+				Verbs:     []string{"*"},
+				APIGroups: []string{""},
+				Resources: []string{"pods"},
+			}),
+		}
+		cats := categorySet(AnalyzeRiskyPermissions(grants))
+		if !cats["pod-create"] {
+			t.Errorf("expected pod-create, got %v", cats)
+		}
+		if cats["cluster-admin"] || cats["secrets-access"] {
+			t.Errorf("narrow wildcard-verb rule must not trip cluster-admin/secrets, got %v", cats)
+		}
+	})
+}
+
+func TestPrintRiskyPermissions_IncompleteAnalysis(t *testing.T) {
+	var buf bytes.Buffer
+	PrintRiskyPermissions(&buf, nil, []error{errors.New("failed to get cluster role x")}, false)
+	got := buf.String()
+	if !strings.Contains(got, "INCOMPLETE") {
+		t.Errorf("expected INCOMPLETE warning, got:\n%s", got)
+	}
+	if !strings.Contains(got, "result incomplete") {
+		t.Errorf("expected incomplete qualifier on the no-risks line, got:\n%s", got)
+	}
+	if strings.Contains(got, "No risky permissions detected.") {
+		t.Errorf("must not print a clean bill of health when incomplete, got:\n%s", got)
+	}
+}
+
+func TestPrintRiskyPermissions_CleanWhenComplete(t *testing.T) {
+	var buf bytes.Buffer
+	PrintRiskyPermissions(&buf, nil, nil, false)
+	if got := buf.String(); !strings.Contains(got, "No risky permissions detected.") {
+		t.Errorf("expected clean message, got:\n%s", got)
+	}
 }

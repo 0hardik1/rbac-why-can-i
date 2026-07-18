@@ -51,23 +51,26 @@ func ResolveAWSAuthIdentity(ctx context.Context, restConfig *rest.Config, iamArn
 		return nil, fmt.Errorf("failed to get aws-auth ConfigMap: %w", err)
 	}
 
-	// Parse mapRoles
+	// Parse mapRoles. Malformed YAML is an error, not a silent miss: skipping
+	// it would resolve the wrong identity without any indication.
 	if mapRolesData, ok := cm.Data["mapRoles"]; ok {
 		var mappings []AWSAuthMapping
-		if err := yaml.Unmarshal([]byte(mapRolesData), &mappings); err == nil {
-			if identity := findMappingForArn(mappings, iamArn, true); identity != nil {
-				return identity, nil
-			}
+		if err := yaml.Unmarshal([]byte(mapRolesData), &mappings); err != nil {
+			return nil, fmt.Errorf("malformed mapRoles in aws-auth ConfigMap: %w", err)
+		}
+		if identity := findMappingForArn(mappings, iamArn, true); identity != nil {
+			return identity, nil
 		}
 	}
 
 	// Parse mapUsers
 	if mapUsersData, ok := cm.Data["mapUsers"]; ok {
 		var mappings []AWSAuthMapping
-		if err := yaml.Unmarshal([]byte(mapUsersData), &mappings); err == nil {
-			if identity := findMappingForArn(mappings, iamArn, false); identity != nil {
-				return identity, nil
-			}
+		if err := yaml.Unmarshal([]byte(mapUsersData), &mappings); err != nil {
+			return nil, fmt.Errorf("malformed mapUsers in aws-auth ConfigMap: %w", err)
+		}
+		if identity := findMappingForArn(mappings, iamArn, false); identity != nil {
+			return identity, nil
 		}
 	}
 

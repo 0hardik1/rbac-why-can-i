@@ -144,6 +144,73 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ---
 # ============================================================
+# resourceNames fixtures: access restricted to one named secret
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: named-secret-sa
+  namespace: test-ns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: named-secret-reader
+  namespace: test-ns
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  resourceNames: ["special-secret"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: named-secret-sa-reader
+  namespace: test-ns
+subjects:
+- kind: ServiceAccount
+  name: named-secret-sa
+  namespace: test-ns
+roleRef:
+  kind: Role
+  name: named-secret-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+# ============================================================
+# Non-core API group fixtures: deployments in the apps group
+# ============================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: deploy-sa
+  namespace: test-ns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: deployment-reader
+  namespace: test-ns
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: deploy-sa-reader
+  namespace: test-ns
+subjects:
+- kind: ServiceAccount
+  name: deploy-sa
+  namespace: test-ns
+roleRef:
+  kind: Role
+  name: deployment-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+# ============================================================
 # Multi-Grant Test Fixtures: 2 roles granting same permission
 # ============================================================
 apiVersion: v1

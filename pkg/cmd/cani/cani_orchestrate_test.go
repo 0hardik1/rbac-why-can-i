@@ -61,10 +61,15 @@ func TestOrchestrate_AccessEntryWins(t *testing.T) {
 	}
 }
 
-func TestOrchestrate_PodIdentityReverseLookup(t *testing.T) {
-	// Caller assumed an IAM role; no Access Entry, no aws-auth match;
-	// Pod Identity has exactly one association for that role.
-	o := newOrchestrateOptions("arn:aws:sts::1:assumed-role/MyRole/sess")
+func TestOrchestrate_PodIdentityIsInformationalOnly(t *testing.T) {
+	// Caller assumed an IAM role; no Access Entry, no aws-auth match; Pod
+	// Identity has an association for that role. Pod Identity must NOT
+	// rewrite the caller's identity (it supplies AWS credentials to pods,
+	// it does not authenticate this caller as the ServiceAccount); it is
+	// surfaced informationally while the identity falls through to the raw
+	// IAM ARN.
+	arn := "arn:aws:sts::1:assumed-role/MyRole/sess"
+	o := newOrchestrateOptions(arn)
 
 	fakeEKS := &fakeEKSClient{
 		describeAccessEntry: func(_ *eks.DescribeAccessEntryInput) (*eks.DescribeAccessEntryOutput, error) {
@@ -85,19 +90,12 @@ func TestOrchestrate_PodIdentityReverseLookup(t *testing.T) {
 		},
 	}
 
-	// Use a fake kube clientset via injected client builder is overkill
-	// for this branch; orchestrate uses ResolveAWSAuthIdentity, which
-	// fails on the unconfigured rest.Config — that error is treated as
-	// a real failure (not ErrAwsAuthNotFound) and produces a warning,
-	// after which Pod Identity reverse-lookup succeeds. This still
-	// exercises the "Pod Identity wins" outcome which is the point.
 	o.orchestrateAWSIdentity(context.Background(), &rest.Config{Host: "http://invalid.invalid"}, fakeEKS)
 
-	want := "system:serviceaccount:apps:worker"
-	if o.As != want {
-		t.Errorf("As = %q, want %q", o.As, want)
+	if o.As != arn {
+		t.Errorf("As = %q, want raw IAM ARN %q", o.As, arn)
 	}
-	if o.CurrentContext.AuthMethod != "aws-iam (via Pod Identity)" {
+	if o.CurrentContext.AuthMethod != "aws-iam (no mapping found)" {
 		t.Errorf("AuthMethod = %q", o.CurrentContext.AuthMethod)
 	}
 	if o.CurrentContext.PodIdentityForRole == nil ||

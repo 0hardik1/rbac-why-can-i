@@ -189,9 +189,10 @@ func TestRuleMatches(t *testing.T) {
 			expected: true,
 		},
 		{
-			// Documented "could match" behavior: a name-scoped rule still
-			// matches a can-i check that omits a specific resource name.
-			name: "name-scoped rule could match when request omits a name",
+			// Kubernetes requires the requested name to match when
+			// resourceNames is non-empty: a nameless request asks for generic
+			// access, which a name-scoped rule does not grant.
+			name: "name-scoped rule does not match when request omits a name",
 			rule: rbacv1.PolicyRule{
 				Verbs:         []string{"get"},
 				APIGroups:     []string{""},
@@ -199,6 +200,16 @@ func TestRuleMatches(t *testing.T) {
 				ResourceNames: []string{"my-secret"},
 			},
 			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "secrets"},
+			expected: false,
+		},
+		{
+			name: "rule without resourceNames matches any name",
+			rule: rbacv1.PolicyRule{
+				Verbs:     []string{"get"},
+				APIGroups: []string{""},
+				Resources: []string{"secrets"},
+			},
+			request:  PermissionRequest{Verb: "get", APIGroup: "", Resource: "secrets", ResourceName: "my-secret"},
 			expected: true,
 		},
 		{
@@ -471,6 +482,34 @@ func TestGetImplicitGroups(t *testing.T) {
 			expectedGroups: []string{
 				"system:authenticated",
 			},
+		},
+		{
+			name: "anonymous user is unauthenticated",
+			subject: Subject{
+				Kind: "User",
+				Name: "system:anonymous",
+			},
+			expectedGroups: []string{
+				"system:unauthenticated",
+			},
+		},
+		{
+			name: "system component user is authenticated",
+			subject: Subject{
+				Kind: "User",
+				Name: "system:kube-scheduler",
+			},
+			expectedGroups: []string{
+				"system:authenticated",
+			},
+		},
+		{
+			name: "group subject has no implicit memberships",
+			subject: Subject{
+				Kind: "Group",
+				Name: "system:masters",
+			},
+			expectedGroups: []string{},
 		},
 	}
 

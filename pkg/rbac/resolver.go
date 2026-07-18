@@ -40,8 +40,10 @@ func ParseSubject(asString string) (Subject, error) {
 		}, nil
 	}
 
-	// Groups typically start with "system:" but aren't serviceaccounts
-	if strings.HasPrefix(asString, "system:") {
+	// Only the well-known system groups are groups. Other system:* names
+	// (system:kube-scheduler, system:anonymous, system:node:<name>, ...) are
+	// users.
+	if isSystemGroup(asString) {
 		return Subject{
 			Kind: "Group",
 			Name: asString,
@@ -53,6 +55,37 @@ func ParseSubject(asString string) (Subject, error) {
 		Kind: "User",
 		Name: asString,
 	}, nil
+}
+
+// systemGroups are the well-known system:* names Kubernetes defines as
+// groups. Everything else under system:* (system:kube-scheduler,
+// system:kube-proxy, system:anonymous, system:apiserver, system:node:<name>,
+// ...) is a user.
+var systemGroups = map[string]bool{
+	"system:masters":         true,
+	"system:authenticated":   true,
+	"system:unauthenticated": true,
+	"system:serviceaccounts": true,
+	"system:nodes":           true,
+	"system:bootstrappers":   true,
+	"system:monitoring":      true,
+}
+
+var systemGroupPrefixes = []string{
+	"system:serviceaccounts:", // per-namespace ServiceAccount groups
+	"system:bootstrappers:",   // bootstrap token groups
+}
+
+func isSystemGroup(name string) bool {
+	if systemGroups[name] {
+		return true
+	}
+	for _, prefix := range systemGroupPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // ResolvePermission finds all grants for a permission request

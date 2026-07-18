@@ -23,13 +23,23 @@ func (p *DotPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *Cont
 		_, _ = fmt.Fprintf(w, "  // Context: %s, Cluster: %s, User: %s\n", ctx.ContextName, ctx.ClusterName, ctx.UserName)
 		writeAWSIdentityComments(w, ctx, "  // ")
 	}
+	for _, e := range result.Errors {
+		_, _ = fmt.Fprintf(w, "  // Error: %s\n", escapeLabel(e.Error()))
+	}
 	_, _ = fmt.Fprintln(w)
 
 	if !result.Allowed {
-		_, _ = fmt.Fprintf(w, "  denied [label=\"DENIED\\n%s cannot %s %s\" shape=octagon style=filled fillcolor=red fontcolor=white];\n",
-			escapeLabel(result.Subject.String()),
-			result.Request.Verb,
-			result.Request.FullResource())
+		if result.Incomplete() {
+			_, _ = fmt.Fprintf(w, "  incomplete [label=\"INCOMPLETE\\nno readable rule grants %s %s to %s\\n(some RBAC objects could not be read)\" shape=octagon style=filled fillcolor=orange];\n",
+				result.Request.Verb,
+				result.Request.FullResource(),
+				escapeLabel(result.Subject.String()))
+		} else {
+			_, _ = fmt.Fprintf(w, "  denied [label=\"DENIED\\n%s cannot %s %s\" shape=octagon style=filled fillcolor=red fontcolor=white];\n",
+				escapeLabel(result.Subject.String()),
+				result.Request.Verb,
+				result.Request.FullResource())
+		}
 		_, _ = fmt.Fprintln(w, "}")
 		return nil
 	}
@@ -84,9 +94,20 @@ func (p *MermaidPrinter) Print(w io.Writer, result *rbac.PermissionResult, ctx *
 		_, _ = fmt.Fprintf(w, "%%%% Context: %s, Cluster: %s, User: %s\n", ctx.ContextName, ctx.ClusterName, ctx.UserName)
 		writeAWSIdentityComments(w, ctx, "%% ")
 	}
+	for _, e := range result.Errors {
+		_, _ = fmt.Fprintf(w, "%%%% Error: %s\n", e.Error())
+	}
 	_, _ = fmt.Fprintln(w, "graph LR")
 
 	if !result.Allowed {
+		if result.Incomplete() {
+			_, _ = fmt.Fprintf(w, "  incomplete{{INCOMPLETE: no readable rule grants %s %s to %s}}\n",
+				result.Request.Verb,
+				result.Request.FullResource(),
+				escapeMermaid(result.Subject.String()))
+			_, _ = fmt.Fprintln(w, "  style incomplete fill:#fa3,stroke:#333")
+			return nil
+		}
 		_, _ = fmt.Fprintf(w, "  denied{{DENIED: %s cannot %s %s}}\n",
 			escapeMermaid(result.Subject.String()),
 			result.Request.Verb,

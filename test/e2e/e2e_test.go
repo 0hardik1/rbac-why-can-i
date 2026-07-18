@@ -279,6 +279,82 @@ func TestShowRisky(t *testing.T) {
 	}
 }
 
+func TestCanI_ResourceNames_DeniedWithoutName(t *testing.T) {
+	// named-secret-sa may only get the secret "special-secret". A generic
+	// "get secrets" (no name) must NOT be allowed by that rule.
+	out, err := runRbacWhy(
+		"can-i",
+		"--as", "system:serviceaccount:test-ns:named-secret-sa",
+		"get", "secrets",
+		"-n", testNS,
+	)
+	if err != nil {
+		t.Fatalf("command failed: %v", err)
+	}
+	if !strings.Contains(out, "DENIED") {
+		t.Errorf("expected DENIED for nameless request against resourceNames rule, got: %s", out)
+	}
+}
+
+func TestCanI_ResourceNames_AllowedWithName(t *testing.T) {
+	out, err := runRbacWhy(
+		"can-i",
+		"--as", "system:serviceaccount:test-ns:named-secret-sa",
+		"get", "secrets", "special-secret",
+		"-n", testNS,
+	)
+	if err != nil {
+		t.Fatalf("command failed: %v", err)
+	}
+	if !strings.Contains(out, "ALLOWED") {
+		t.Errorf("expected ALLOWED for named request, got: %s", out)
+	}
+	if !strings.Contains(out, "named-secret-reader") {
+		t.Errorf("expected named-secret-reader role in output, got: %s", out)
+	}
+}
+
+func TestCanI_APIGroupResolvedViaDiscovery(t *testing.T) {
+	// deploy-sa's role grants get deployments in the apps group. The user
+	// typed no group; discovery must resolve "deployments" to apps instead
+	// of checking the core group and denying.
+	out, err := runRbacWhy(
+		"can-i",
+		"--as", "system:serviceaccount:test-ns:deploy-sa",
+		"get", "deployments",
+		"-n", testNS,
+	)
+	if err != nil {
+		t.Fatalf("command failed: %v", err)
+	}
+	if !strings.Contains(out, "ALLOWED") {
+		t.Errorf("expected ALLOWED via discovery-resolved apps group, got: %s", out)
+	}
+}
+
+func TestCanI_ClusterScopedResourceIgnoresNamespace(t *testing.T) {
+	// Nodes are cluster-scoped; a namespace on the request must be ignored
+	// rather than pulling in namespaced RoleBindings.
+	out, err := runRbacWhy(
+		"can-i",
+		"--as", "system:serviceaccount:test-ns:test-sa",
+		"list", "nodes",
+		"-n", testNS,
+	)
+	if err != nil {
+		t.Fatalf("command failed: %v", err)
+	}
+	if !strings.Contains(out, "ALLOWED") {
+		t.Errorf("expected ALLOWED, got: %s", out)
+	}
+	if !strings.Contains(out, "cluster-wide") {
+		t.Errorf("expected cluster-wide scope, got: %s", out)
+	}
+	if strings.Contains(out, "in namespace") {
+		t.Errorf("cluster-scoped request must not report a namespace, got: %s", out)
+	}
+}
+
 func TestMultipleGrants_TwoRoles(t *testing.T) {
 	// dual-grant-sa has the same permission (get configmaps) granted through:
 	// 1. RoleBinding -> Role (configmap-reader-role)

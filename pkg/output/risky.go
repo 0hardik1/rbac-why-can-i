@@ -3,6 +3,7 @@ package output
 import (
 	"fmt"
 	"io"
+	"strings"
 
 	rbacv1 "k8s.io/api/rbac/v1"
 
@@ -19,63 +20,69 @@ type RiskyPattern struct {
 	Resources   []string
 }
 
-// RiskyPatterns contains known dangerous permission patterns
+// RiskyPatterns contains known dangerous permission patterns.
+//
+// Pattern values are concrete targets, never wildcards: a rule matches a
+// pattern when one of its values equals the pattern value OR the rule itself
+// carries a wildcard ("*", or "*/subresource" for resources) that covers it.
+// The one exception is cluster-admin, where "*" is itself the target: only a
+// rule that literally grants "*" on every dimension matches it.
 var RiskyPatterns = []RiskyPattern{
 	{
 		Category:    "secrets-access",
 		Severity:    "critical",
 		Description: "Access to Secrets can expose sensitive credentials, tokens, and keys",
-		Verbs:       []string{"get", "list", "watch", "*"},
-		APIGroups:   []string{"", "*"},
-		Resources:   []string{"secrets", "*"},
+		Verbs:       []string{"get", "list", "watch"},
+		APIGroups:   []string{""},
+		Resources:   []string{"secrets"},
 	},
 	{
 		Category:    "pod-exec",
 		Severity:    "critical",
 		Description: "Pod exec allows arbitrary command execution in containers",
-		Verbs:       []string{"create", "*"},
-		APIGroups:   []string{"", "*"},
-		Resources:   []string{"pods/exec", "*"},
+		Verbs:       []string{"create"},
+		APIGroups:   []string{""},
+		Resources:   []string{"pods/exec"},
 	},
 	{
 		Category:    "pod-attach",
 		Severity:    "critical",
 		Description: "Pod attach allows connecting to running containers",
-		Verbs:       []string{"create", "*"},
-		APIGroups:   []string{"", "*"},
-		Resources:   []string{"pods/attach", "*"},
+		Verbs:       []string{"create"},
+		APIGroups:   []string{""},
+		Resources:   []string{"pods/attach"},
 	},
 	{
 		Category:    "pod-create",
 		Severity:    "high",
 		Description: "Pod creation can lead to privilege escalation via hostPath, hostPID, etc.",
-		Verbs:       []string{"create", "*"},
-		APIGroups:   []string{"", "*"},
-		Resources:   []string{"pods", "*"},
+		Verbs:       []string{"create"},
+		APIGroups:   []string{""},
+		Resources:   []string{"pods"},
 	},
 	{
 		Category:    "impersonate",
 		Severity:    "critical",
 		Description: "Impersonation allows assuming other user/group identities",
-		Verbs:       []string{"impersonate", "*"},
-		APIGroups:   []string{"", "*"},
-		Resources:   []string{"users", "groups", "serviceaccounts", "*"},
+		Verbs:       []string{"impersonate"},
+		APIGroups:   []string{""},
+		Resources:   []string{"users", "groups", "serviceaccounts"},
 	},
 	{
 		Category:    "nodes-proxy",
 		Severity:    "critical",
 		Description: "Node proxy access can execute commands on nodes via kubelet API",
-		Verbs:       []string{"get", "create", "*"},
-		APIGroups:   []string{"", "*"},
-		Resources:   []string{"nodes/proxy", "*"},
+		Verbs:       []string{"get", "create"},
+		APIGroups:   []string{""},
+		Resources:   []string{"nodes/proxy"},
 	},
 	{
 		Category:    "persistent-volume-create",
 		Severity:    "high",
 		Description: "PV creation with hostPath can access node filesystem",
-		Verbs:       []string{"create", "*"},
-		APIGroups:   []string{"", "*"},
-		Resources:   []string{"persistentvolumes", "*"},
+		Verbs:       []string{"create"},
+		APIGroups:   []string{""},
+		Resources:   []string{"persistentvolumes"},
 	},
 	{
 		Category:    "cluster-admin",
@@ -89,33 +96,33 @@ var RiskyPatterns = []RiskyPattern{
 		Category:    "role-escalation",
 		Severity:    "critical",
 		Description: "Ability to create/modify roles can escalate privileges",
-		Verbs:       []string{"create", "update", "patch", "*"},
-		APIGroups:   []string{"rbac.authorization.k8s.io", "*"},
-		Resources:   []string{"roles", "clusterroles", "*"},
+		Verbs:       []string{"create", "update", "patch", "escalate"},
+		APIGroups:   []string{"rbac.authorization.k8s.io"},
+		Resources:   []string{"roles", "clusterroles"},
 	},
 	{
 		Category:    "binding-escalation",
 		Severity:    "critical",
 		Description: "Ability to create/modify bindings can grant any permissions",
-		Verbs:       []string{"create", "update", "patch", "*"},
-		APIGroups:   []string{"rbac.authorization.k8s.io", "*"},
-		Resources:   []string{"rolebindings", "clusterrolebindings", "*"},
+		Verbs:       []string{"create", "update", "patch", "bind"},
+		APIGroups:   []string{"rbac.authorization.k8s.io"},
+		Resources:   []string{"rolebindings", "clusterrolebindings"},
 	},
 	{
 		Category:    "csr-approve",
 		Severity:    "high",
 		Description: "CSR approval can issue certificates for any identity",
-		Verbs:       []string{"approve", "*"},
-		APIGroups:   []string{"certificates.k8s.io", "*"},
-		Resources:   []string{"certificatesigningrequests/approval", "*"},
+		Verbs:       []string{"update", "approve"},
+		APIGroups:   []string{"certificates.k8s.io"},
+		Resources:   []string{"certificatesigningrequests/approval"},
 	},
 	{
 		Category:    "token-request",
 		Severity:    "high",
 		Description: "Token request can generate tokens for any service account",
-		Verbs:       []string{"create", "*"},
-		APIGroups:   []string{"", "*"},
-		Resources:   []string{"serviceaccounts/token", "*"},
+		Verbs:       []string{"create"},
+		APIGroups:   []string{""},
+		Resources:   []string{"serviceaccounts/token"},
 	},
 }
 
@@ -151,66 +158,58 @@ func AnalyzeRiskyPermissions(grants []rbac.PermissionGrant) []rbac.RiskyPermissi
 	return risks
 }
 
+// matchesRiskyPattern reports whether the rule actually grants what the
+// pattern describes. Only rule-side wildcards widen a match; pattern values
+// are compared literally. This keeps "get deployments.apps" from matching a
+// secrets pattern, and keeps "verbs=[*] resources=[pods]" from being labeled
+// cluster-admin.
 func matchesRiskyPattern(rule rbacv1.PolicyRule, pattern RiskyPattern) bool {
-	verbMatch := false
-	for _, pv := range pattern.Verbs {
-		for _, rv := range rule.Verbs {
-			if rv == pv || rv == "*" {
-				verbMatch = true
-				break
-			}
-		}
-		if verbMatch {
-			break
-		}
-	}
-	if !verbMatch {
-		return false
-	}
-
-	groupMatch := false
-	for _, pg := range pattern.APIGroups {
-		for _, rg := range rule.APIGroups {
-			// A rule matches the pattern's group when the group is equal or the
-			// rule grants all groups ("*"). A pattern entry of "*" only matches a
-			// rule that itself uses "*", so it does not match every rule.
-			if rg == pg || rg == "*" {
-				groupMatch = true
-				break
-			}
-		}
-		if groupMatch {
-			break
-		}
-	}
-	if !groupMatch {
-		return false
-	}
-
-	resourceMatch := false
-	for _, pr := range pattern.Resources {
-		for _, rr := range rule.Resources {
-			// As with groups: equal resource, or a rule that grants all
-			// resources ("*"). A pattern entry of "*" only matches a rule that
-			// itself uses "*".
-			if rr == pr || rr == "*" {
-				resourceMatch = true
-				break
-			}
-		}
-		if resourceMatch {
-			break
-		}
-	}
-
-	return resourceMatch
+	return ruleCoversAny(rule.Verbs, pattern.Verbs, false) &&
+		ruleCoversAny(rule.APIGroups, pattern.APIGroups, false) &&
+		ruleCoversAny(rule.Resources, pattern.Resources, true)
 }
 
-// PrintRiskyPermissions outputs risky permissions analysis. color enables ANSI
-// coloring of the severity headers.
-func PrintRiskyPermissions(w io.Writer, risks []rbac.RiskyPermission, color bool) {
+// ruleCoversAny reports whether any rule value grants any pattern value.
+// A rule value covers a pattern value when they are equal or when the rule
+// value is "*". With resourceSemantics, a rule value of "*/sub" additionally
+// covers any pattern value of the form "resource/sub", mirroring the
+// Kubernetes RBAC evaluator.
+func ruleCoversAny(ruleVals, patternVals []string, resourceSemantics bool) bool {
+	for _, p := range patternVals {
+		for _, r := range ruleVals {
+			if r == p || r == "*" {
+				return true
+			}
+			if resourceSemantics && strings.HasPrefix(r, "*/") {
+				if idx := strings.Index(p, "/"); idx != -1 && p[idx+1:] == r[2:] {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// PrintRiskyPermissions outputs risky permissions analysis. resolveErrs are
+// failures that occurred while gathering the subject's permissions; when
+// non-empty the analysis is incomplete and is reported as such rather than as
+// a clean bill of health. color enables ANSI coloring of the severity headers.
+func PrintRiskyPermissions(w io.Writer, risks []rbac.RiskyPermission, resolveErrs []error, color bool) {
+	if len(resolveErrs) > 0 {
+		_, _ = fmt.Fprintf(w, "%s: analysis is INCOMPLETE, %d RBAC object(s) could not be read:\n",
+			colorize(color, colorYellow, "WARNING"), len(resolveErrs))
+		for _, e := range resolveErrs {
+			_, _ = fmt.Fprintf(w, "  - %v\n", e)
+		}
+		_, _ = fmt.Fprintln(w)
+	}
+
 	if len(risks) == 0 {
-		_, _ = fmt.Fprintln(w, "No risky permissions detected.")
+		if len(resolveErrs) > 0 {
+			_, _ = fmt.Fprintln(w, "No risky permissions detected in the readable RBAC objects (result incomplete).")
+		} else {
+			_, _ = fmt.Fprintln(w, "No risky permissions detected.")
+		}
 		return
 	}
 
